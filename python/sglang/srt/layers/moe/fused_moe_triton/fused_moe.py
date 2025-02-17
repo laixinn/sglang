@@ -548,7 +548,6 @@ def invoke_fused_moe_kernel(
     else:
         even_Ks = False
 
-    torch.cuda.synchronize()
     fused_moe_kernel[grid](
         A,
         B,
@@ -1054,7 +1053,8 @@ def fused_experts_impl(
 
         if activation == "silu":
             if _is_cuda:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                # silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
             else:
                 ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
         elif activation == "gelu":
