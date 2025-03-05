@@ -635,9 +635,9 @@ def gemm_fp8_fp8_bf16_nt(
 ) -> torch.Tensor:
     if out is None:
         out = torch.empty(
-            (lhs.shape[0], rhs.shape[1]),
+            (lhs.shape[0], rhs.shape[0]),
             device=lhs.device,
             dtype=torch.bfloat16,
         )
-    torch.ops.sglang.gemm_fp8_fp8_bf16_nt(lhs, lhs_scale, rhs, rhs_scale, out)
+    torch.ops.sgl_kernels.gemm_fp8_fp8_bf16_nt(lhs, lhs_scale, rhs, rhs_scale, out)
     return out

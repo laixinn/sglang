@@ -36,7 +36,7 @@ int get_num_sms(){
     return _num_sms;
 }
 
-int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k = 128){
+int get_smem_size(int num_stages, int k, int block_m, int block_n = 128, int block_k = 128){
     // fork from deep_gemm/jit_kernels/gemm.py, translate py to cu
     int smem_d = block_m * block_n * 2;
     int smem_a_per_stage = block_m * block_k;
@@ -242,12 +242,12 @@ void gemm_fp8_fp8_bf16_nt_N_K(torch::Tensor& lhs, torch::Tensor& lhs_scales,
     using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal>;
 
     // Launch kernel
-    auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs.data_ptr<__nv_fp8_e4m3>(), m);
-    auto tma_b_desc = GemmType::make_2d_tma_b_desc(rhs.data_ptr<__nv_fp8_e4m3>());
+    auto tma_a_desc = GemmType::make_2d_tma_a_desc((__nv_fp8_e4m3*)lhs.data_ptr(), m);
+    auto tma_b_desc = GemmType::make_2d_tma_b_desc((__nv_fp8_e4m3*)rhs.data_ptr());
     auto tma_scales_a_desc = GemmType::make_2d_tma_scales_a_desc(lhs_scales.data_ptr<float>(), m);
-    auto tma_d_desc = GemmType::make_2d_tma_d_desc(out.data_ptr<__nv_bfloat16>(), m);
+    auto tma_d_desc = GemmType::make_2d_tma_d_desc((__nv_bfloat16*)out.data_ptr(), m);
     GemmType::run(
-                out.data_ptr<__nv_bfloat16>(), rhs_scales.data_ptr<float>(), nullptr,
+                (__nv_bfloat16*)out.data_ptr(), rhs_scales.data_ptr<float>(), nullptr,
                 m,
                 tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc,
                 stream, num_sms, smem_size);
@@ -264,7 +264,7 @@ void gemm_fp8_fp8_bf16_nt(torch::Tensor& lhs, torch::Tensor& lhs_scales,
     uint32_t m_ = out.size(0);
     uint32_t n_ = out.size(1);
 
-    TORCH_CHECK(n % 64 == 0 && k % 128 == 0);
+    TORCH_CHECK(n % 128 == 0 && k % 128 == 0);
 
     // Type and shape checks
     TORCH_CHECK(m == m_ && n == n_ && k == k_);
@@ -284,19 +284,69 @@ void gemm_fp8_fp8_bf16_nt(torch::Tensor& lhs, torch::Tensor& lhs_scales,
     if(m==0)
         return;
 
-    constexpr auto BLOCK_M = 128;
+    constexpr auto BLOCK_M = 64;
     constexpr auto BLOCK_N = 128;
     constexpr auto kNumStages = 8;
     constexpr auto kNumTMAMulticast = 1;
+    // constexpr auto num_sms = 78;
+    // constexpr auto smem_size = 215392;
     int num_sms = get_num_sms();
     const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
+    TORCH_CHECK(smem_size <= 232448); //sm90_capacity
     // auto [BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast, smem_size] = get_best_configs(m, n, k, 1, num_sms);
+    // (64, 128, 8, 1, 215392)
     auto stream = at::cuda::getCurrentCUDAStream(lhs.get_device());
 
     // dispatch
-    if(n==128 && k==128){
-        gemm_fp8_fp8_bf16_nt_N_K<128, 128, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+    // constexpr int TP = 16;
+    // if (n == 36 && k == 7168)
+    //     // q_proj for q: (512+64)/tp, 7168
+    //     gemm_fp8_fp8_bf16_nt_N_K<36, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+    //         lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+    //     );
+    if (n == 1536 && k == 7168)
+        // q_a_proj
+        gemm_fp8_fp8_bf16_nt_N_K<1536, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
             lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
         );
-    }
+    else if(n == 1536 && k == 1536)
+        // q_b_proj when q_lora: 24576/tp, 1536
+        gemm_fp8_fp8_bf16_nt_N_K<1536, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 24576 && k == 7168)
+        // kv_a_proj_with_mqa for kv: (128 + 64) * 128, 7168
+        gemm_fp8_fp8_bf16_nt_N_K<24576, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 2048 && k == 512)
+        // kv_b_proj for k: 128 * (128 + 128)/tp, 512
+        gemm_fp8_fp8_bf16_nt_N_K<2048, 512, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 7168 && k == 1024)
+        // o_proj: 7168, 16384/tp
+        gemm_fp8_fp8_bf16_nt_N_K<7168, 1024, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 2304 && k == 7168)
+        // gate_up_proj for FFN: 18432 * 2/tp, 7168
+        gemm_fp8_fp8_bf16_nt_N_K<2304, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 256 && k == 7168)
+        // gate_up_proj for MoE: 4096/tp, 7168
+        gemm_fp8_fp8_bf16_nt_N_K<256, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 7168 && k == 1152)
+        // down_proj for FFN: 7168, 18432/tp
+        gemm_fp8_fp8_bf16_nt_N_K<7168, 1152, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 7168 && k == 256)
+        // down_proj for MoE: 7168, 2048/tp
+        gemm_fp8_fp8_bf16_nt_N_K<7168, 256, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
 }

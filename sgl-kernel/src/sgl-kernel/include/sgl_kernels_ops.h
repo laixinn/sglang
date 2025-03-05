@@ -159,6 +159,6 @@ void cublas_grouped_gemm(const std::vector<torch::Tensor>& inputs, const std::ve
                          int64_t cublas_handle, int64_t cuda_stream);
 
 // deepseek gemm
-void gemm_fp8_fp8_bf16_nt(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
-                          const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
+void gemm_fp8_fp8_bf16_nt(torch::Tensor& lhs, torch::Tensor& lhs_scales,
+                          torch::Tensor& rhs, torch::Tensor& rhs_scales,
                           torch::Tensor& out);
