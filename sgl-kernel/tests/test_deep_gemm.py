@@ -67,7 +67,6 @@ class TestFp8Gemm(unittest.TestCase):
         for M in Ms:
             for N, K in NKs:
                 for out_dtype in out_dtypes:
-                    print(M, N, K)
                     self._test_accuracy_once(M, N, K, out_dtype, "cuda")
 
 
