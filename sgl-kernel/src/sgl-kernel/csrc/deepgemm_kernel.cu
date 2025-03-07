@@ -292,29 +292,29 @@ void gemm_fp8_fp8_bf16_nt(torch::Tensor& lhs, torch::Tensor& lhs_scales,
         return;
 
     // default config
-    constexpr auto BLOCK_M = 64;
-    constexpr auto BLOCK_N = 128;
-    constexpr auto kNumStages = 8;
-    constexpr auto kNumTMAMulticast = 1;
+    // constexpr auto BLOCK_M = 64;
+    // constexpr auto BLOCK_N = 128;
+    // constexpr auto kNumStages = 8;
+    // constexpr auto kNumTMAMulticast = 1;
     const int num_sms = get_num_sms();
-    const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
-    TORCH_CHECK(smem_size <= 232448); //sm90_capacity
+    // const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
+    // TORCH_CHECK(smem_size <= 232448); //sm90_capacity
     // auto [BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast, smem_size] = get_best_configs(m, n, k, 1, num_sms);
     // (64, 128, 8, 1, 215392)
     auto stream = at::cuda::getCurrentCUDAStream();
 
     // dispatch with m=16 best tuning config
-    // constexpr int TP = 16;
-    // if (n == 36 && k == 7168)
+    // constexpr int TP = 8;
+    // if (n == 72 && k == 7168)
     //     // q_proj for q: (512+64)/tp, 7168
-    //     gemm_fp8_fp8_bf16_nt_N_K<36, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+    //     gemm_fp8_fp8_bf16_nt_N_K<72, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
     //         lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
     //     );
     if (n == 1536 && k == 7168){
         // q_a_proj
         constexpr uint32_t BLOCK_M = 64;
-        // constexpr uint32_t BLOCK_N = 24;
-        constexpr uint32_t kNumStages = 6;
+        constexpr uint32_t BLOCK_N = 128;
+        constexpr uint32_t kNumStages = 8;
         constexpr uint32_t kNumTMAMulticast = 1;
         const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
         TORCH_CHECK(smem_size <= 232448); //sm90_capacity
@@ -322,23 +322,23 @@ void gemm_fp8_fp8_bf16_nt(torch::Tensor& lhs, torch::Tensor& lhs_scales,
             lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
         );
     }
-    else if(n == 1536 && k == 1536){
+    else if(n == 3072 && k == 1536){
         // q_b_proj when q_lora: 24576/tp, 1536
         constexpr uint32_t BLOCK_M = 64;
-        // constexpr uint32_t BLOCK_N = 24;
-        constexpr uint32_t kNumStages = 6;
+        constexpr uint32_t BLOCK_N = 128;
+        constexpr uint32_t kNumStages = 8;
         constexpr uint32_t kNumTMAMulticast = 1;
         const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
         TORCH_CHECK(smem_size <= 232448); //sm90_capacity
-        gemm_fp8_fp8_bf16_nt_N_K<1536, 1536, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+        gemm_fp8_fp8_bf16_nt_N_K<3072, 1536, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
             lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
         );
     }
     else if(n == 24576 && k == 7168){
         // kv_a_proj_with_mqa for kv: (128 + 64) * 128, 7168
         constexpr uint32_t BLOCK_M = 64;
-        // constexpr uint32_t BLOCK_N = 112;
-        constexpr uint32_t kNumStages = 6;
+        constexpr uint32_t BLOCK_N = 128;
+        constexpr uint32_t kNumStages = 8;
         constexpr uint32_t kNumTMAMulticast = 1;
         const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
         TORCH_CHECK(smem_size <= 232448); //sm90_capacity
@@ -346,75 +346,75 @@ void gemm_fp8_fp8_bf16_nt(torch::Tensor& lhs, torch::Tensor& lhs_scales,
             lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
         );
     }
-    else if(n == 2048 && k == 512){
+    else if(n == 4096 && k == 512){
         // kv_b_proj for k: 128 * (128 + 128)/tp, 512
         constexpr uint32_t BLOCK_M = 64;
-        // constexpr uint32_t BLOCK_N = 32;
+        constexpr uint32_t BLOCK_N = 128;
         constexpr uint32_t kNumStages = 8;
         constexpr uint32_t kNumTMAMulticast = 1;
         const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
         TORCH_CHECK(smem_size <= 232448); //sm90_capacity
-        gemm_fp8_fp8_bf16_nt_N_K<2048, 512, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+        gemm_fp8_fp8_bf16_nt_N_K<4096, 512, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
             lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
         );
     }
-    else if(n == 7168 && k == 1024){
+    else if(n == 7168 && k == 2048){
         // o_proj: 7168, 16384/tp
         constexpr uint32_t BLOCK_M = 64;
-        // constexpr uint32_t BLOCK_N = 96;
-        constexpr uint32_t kNumStages = 6;
+        constexpr uint32_t BLOCK_N = 128;
+        constexpr uint32_t kNumStages = 8;
         constexpr uint32_t kNumTMAMulticast = 1;
         const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
         TORCH_CHECK(smem_size <= 232448); //sm90_capacity
-        gemm_fp8_fp8_bf16_nt_N_K<7168, 1024, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+        gemm_fp8_fp8_bf16_nt_N_K<7168, 2048, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
             lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
         );
     }
-    else if(n == 2304 && k == 7168){
+    else if(n == 4608 && k == 7168){
         // gate_up_proj for FFN: 18432 * 2/tp, 7168
         constexpr uint32_t BLOCK_M = 64;
-        // constexpr uint32_t BLOCK_N = 32;
+        constexpr uint32_t BLOCK_N = 128;
         constexpr uint32_t kNumStages = 8;
         constexpr uint32_t kNumTMAMulticast = 1;
         const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
         TORCH_CHECK(smem_size <= 232448); //sm90_capacity
-        gemm_fp8_fp8_bf16_nt_N_K<2304, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+        gemm_fp8_fp8_bf16_nt_N_K<4608, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
             lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
         );
     }
-    else if(n == 256 && k == 7168){
+    else if(n == 512 && k == 7168){
         // gate_up_proj for MoE: 4096/tp, 7168
         constexpr uint32_t BLOCK_M = 64;
-        // constexpr uint32_t BLOCK_N = 16;
+        constexpr uint32_t BLOCK_N = 128;
         constexpr uint32_t kNumStages = 8;
         constexpr uint32_t kNumTMAMulticast = 1;
         const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
         TORCH_CHECK(smem_size <= 232448); //sm90_capacity
-        gemm_fp8_fp8_bf16_nt_N_K<256, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+        gemm_fp8_fp8_bf16_nt_N_K<512, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
             lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
         );
     }
-    else if(n == 7168 && k == 1152){
+    else if(n == 7168 && k == 2304){
         // down_proj for FFN: 7168, 18432/tp
         constexpr uint32_t BLOCK_M = 64;
-        // constexpr uint32_t BLOCK_N = 96;
-        constexpr uint32_t kNumStages = 6;
+        constexpr uint32_t BLOCK_N = 128;
+        constexpr uint32_t kNumStages = 8;
         constexpr uint32_t kNumTMAMulticast = 1;
         const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
         TORCH_CHECK(smem_size <= 232448); //sm90_capacity
-        gemm_fp8_fp8_bf16_nt_N_K<7168, 1152, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+        gemm_fp8_fp8_bf16_nt_N_K<7168, 2304, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
             lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
         );
     }
-    else if(n == 7168 && k == 256){
+    else if(n == 7168 && k == 512){
         // down_proj for MoE: 7168, 2048/tp
         constexpr uint32_t BLOCK_M = 64;
-        // constexpr uint32_t BLOCK_N = 96;
-        constexpr uint32_t kNumStages = 6;
+        constexpr uint32_t BLOCK_N = 128;
+        constexpr uint32_t kNumStages = 8;
         constexpr uint32_t kNumTMAMulticast = 1;
         const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
         TORCH_CHECK(smem_size <= 232448); //sm90_capacity
-        gemm_fp8_fp8_bf16_nt_N_K<7168, 256, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+        gemm_fp8_fp8_bf16_nt_N_K<7168, 512, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
             lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
         );
     }
