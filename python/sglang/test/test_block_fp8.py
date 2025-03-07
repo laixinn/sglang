@@ -266,7 +266,8 @@ class TestDeepGemmW8A8BlockFP8Matmul(unittest.TestCase):
         )
 
     def test_w8a8_block_fp8_matmul_dsv3_shape(self):
-        assert int(os.getenv("SGL_ENABLE_DEEPGEMM", "0"))==1
+        assert int(os.getenv("SGL_ENABLE_DEEPGEMM", "0")) == 1 or \
+            int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0")) == 1
         for params in itertools.product(
             self.M,
             self.NKs,
