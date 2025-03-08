@@ -53,6 +53,7 @@ def _get_version():
 
 class PostBuildCommand(bdist_wheel):
     """post process for deep gemm build"""
+
     def run(self):
         bdist_wheel.run(self)
         self.make_jit_include_symlinks()
@@ -250,7 +251,7 @@ setup(
         "build_ext": BuildExtension.with_options(use_ninja=True),
         "build_py": CustomBuildPy,
         "bdist_wheel": PostBuildCommand,
-        "develop": PostBuildCommand
+        "develop": PostBuildCommand,
     },
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
