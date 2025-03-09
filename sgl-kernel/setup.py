@@ -66,8 +66,6 @@ include_dirs = [
     flashinfer.resolve() / "include" / "gemm",
     flashinfer.resolve() / "csrc",
     "cublas",
-    turbomind.resolve(),
-    turbomind.resolve() / "src",
 ]
 
 
