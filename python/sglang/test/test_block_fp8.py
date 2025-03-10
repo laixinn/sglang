@@ -403,5 +403,103 @@ class TestW8A8BlockFP8FusedMoE(unittest.TestCase):
                 self._w8a8_block_fp8_fused_moe(*params)
 
 
+class TestDeepGemmGroupGemm(unittest.TestCase):
+    # DeepSeek V3 shapes and tp8
+    DTYPES = [torch.bfloat16]
+    M = [64, 128, 512, 1024]#, 4096]
+    N = [128, 256]#, 1024, 2048]
+    K = [256, 4096]#, 5120, 7168]
+    E = [8, 24] + [256]
+    TOP_KS = [2, 6] + [8]
+    BLOCK_SIZE = [[128, 128]]
+    SEEDS = [0]
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        torch.set_default_device("cuda")
+
+    def _w8a8_block_fp8_fused_moe(self, M, N, K, E, topk, block_size, dtype, seed):
+        torch.manual_seed(seed)
+        # NOTE(HandH1998): to avoid overflow when out_dtype = torch.half
+        factor_for_scale = 1e-2
+        fp8_info = torch.finfo(torch.float8_e4m3fn)
+        fp8_max, fp8_min = fp8_info.max, fp8_info.min
+
+        a = torch.randn((M, K), dtype=dtype) / 10
+
+        w1_fp32 = (torch.rand((E, 2 * N, K), dtype=torch.float32) - 0.5) * 2 * fp8_max
+        w1 = w1_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+
+        w2_fp32 = (torch.rand((E, K, N), dtype=torch.float32) - 0.5) * 2 * fp8_max
+        w2 = w2_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+
+        block_n, block_k = block_size[0], block_size[1]
+        n_tiles_w1 = (2 * N + block_n - 1) // block_n
+        n_tiles_w2 = (K + block_n - 1) // block_n
+        k_tiles_w1 = (K + block_k - 1) // block_k
+        k_tiles_w2 = (N + block_k - 1) // block_k
+
+        w1_s = (
+            torch.rand((E, n_tiles_w1, k_tiles_w1), dtype=torch.float32)
+            * factor_for_scale
+        )
+        w2_s = (
+            torch.rand((E, n_tiles_w2, k_tiles_w2), dtype=torch.float32)
+            * factor_for_scale
+        )
+
+        score = torch.randn((M, E), dtype=dtype)
+
+        with torch.inference_mode():
+            out = fused_moe(
+                a,
+                w1,
+                w2,
+                score,
+                topk,
+                renormalize=False,
+                use_fp8_w8a8=True,
+                w1_scale=w1_s,
+                w2_scale=w2_s,
+                block_shape=block_size,
+            )
+            ref_out = torch_w8a8_block_fp8_moe(
+                a, w1, w2, w1_s, w2_s, score, topk, block_size
+            )
+
+        print(torch.mean(torch.abs(out.to(torch.float32) - ref_out.to(torch.float32)))/ torch.mean(torch.abs(ref_out.to(torch.float32))))
+
+        self.assertTrue(
+            torch.mean(torch.abs(out.to(torch.float32) - ref_out.to(torch.float32)))
+            / torch.mean(torch.abs(ref_out.to(torch.float32)))
+            < 0.02
+        )
+
+    def test_w8a8_block_fp8_fused_moe(self):
+        for params in itertools.product(
+            self.M,
+            self.N,
+            self.K,
+            self.E,
+            self.TOP_KS,
+            self.BLOCK_SIZE,
+            self.DTYPES,
+            self.SEEDS,
+        ):
+            with self.subTest(
+                M=params[0],
+                N=params[1],
+                K=params[2],
+                E=params[3],
+                topk=params[4],
+                block_size=params[5],
+                dtype=params[6],
+                seed=params[7],
+            ):
+                self._w8a8_block_fp8_fused_moe(*params)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
