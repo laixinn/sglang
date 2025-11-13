@@ -134,7 +134,7 @@ def cutlass_fused_experts_fp8(
     c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
 
     prepare_moe_input(
-        topk_ids,
+        topk_ids.to(torch.int32),
         expert_offsets,
         problem_sizes1,
         problem_sizes2,

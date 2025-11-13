@@ -358,9 +358,7 @@ class Qwen3MoeAttention(nn.Module):
             rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
-        self.compatible_with_fused_kv_buffer = (
-            False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
-        )
+        self.compatible_with_fused_kv_buffer = False
 
         self.attn = RadixAttention(
             self.num_heads,
