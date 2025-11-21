@@ -24,4 +24,21 @@ if awk "BEGIN {exit !("$CUDA_VERSION" >= 12.6 && "$CUDA_VERSION" < 12.8)}"; then
     # Clean up temporary files
     rm -f "${NVCC_ARCHIVE_TAR}"
     rm -rf "${NVCC_ARCHIVE_NAME}"
+elif awk "BEGIN {exit !("$CUDA_VERSION" == 12.8)}"; then
+    NVCC_ARCHIVE_VERSION="12.6.85"
+    NVCC_ARCHIVE_NAME="cuda_nvcc-linux-x86_64-${NVCC_ARCHIVE_VERSION}-archive"
+    NVCC_ARCHIVE_TAR="${NVCC_ARCHIVE_NAME}.tar.xz"
+    NVCC_ARCHIVE_URL="https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/linux-x86_64/${NVCC_ARCHIVE_TAR}"
+
+    wget "$NVCC_ARCHIVE_URL"
+    tar -xf "$NVCC_ARCHIVE_TAR"
+
+    if [ -f "/usr/local/cuda/bin/ptxas" ]; then
+        rm -f /usr/local/cuda/bin/ptxas
+    fi
+    cp "${NVCC_ARCHIVE_NAME}/bin/ptxas" /usr/local/cuda/bin/
+
+    # Clean up temporary files
+    rm -f "${NVCC_ARCHIVE_TAR}"
+    rm -rf "${NVCC_ARCHIVE_NAME}"
 fi
