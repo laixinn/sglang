@@ -29,6 +29,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt import single_batch_overlap
+from sglang.srt.layers.moe.usc_moe_cache import (
+    USCMoECache,
+)
+from sglang.srt.layers.moe.index_estimator import MoEIndexPredictor
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
@@ -656,6 +660,27 @@ class DeepseekV2MoE(nn.Module):
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
         )
 
+        # Initialize USC MoE cache for decode optimization
+        self.usc_cache = None
+        self.moe_index_predictor = None
+
+        if self._enable_a2a_moe:
+            try:
+                self.usc_cache = USCMoECache(
+                    index_estimator=lambda *args: None,  # Placeholder, not used in current implementation
+                    rank=parallel_state.get_tensor_model_parallel_rank(),
+                    world_size=self.tp_size,
+                    device_group=parallel_state.get_tp_group().device_group,
+                    num_experts=self.num_experts,
+                    top_k=self.top_k,
+                    hidden_size=config.hidden_size,
+                    params_dtype=config.torch_dtype,
+                    deepep_mode=get_deepep_mode(),
+                )
+                self.moe_index_predictor = MoEIndexPredictor()
+            except Exception as e:
+                raise ValueError(f"[USCMoECache] Failed to initialize for layer {layer_id}: {e}")
+    
     def get_moe_weights(self):
         return [
             x.data
@@ -837,6 +862,13 @@ class DeepseekV2MoE(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         shared_output = None
+
+        # Check if we have predicted index from previous layer (for USC cache flow)
+        predicted_data = None
+        has_predictions_attr = hasattr(forward_batch, 'next_layer_index_predictions')
+        if has_predictions_attr:
+            predicted_data = forward_batch.next_layer_index_predictions.get(self.layer_id)
+        
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
@@ -855,18 +887,40 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device
             )
 
-        final_hidden_states, sbo_shared_output = single_batch_overlap.execute_sbo(
+        # Get predicted topk_idx and topk_weights if available
+        predicted_topk_idx = predicted_data["topk_idx"] if predicted_data is not None else None
+        predicted_topk_weights = predicted_data["topk_weights"] if predicted_data is not None else None
+        
+        # Get next_layer_gate and next_layer_topk if available (may be None if not set up)
+        next_layer_gate = getattr(self, 'next_layer_gate', None)
+        next_layer_topk = getattr(self, 'next_layer_topk', None)
+        
+        # Get usc_cache if available (may be None if not initialized)
+        # usc_cache = getattr(self, 'usc_cache', None)
+        
+        final_hidden_states, sbo_shared_output = single_batch_overlap.execute_sbo_with_usc_cache(
+            experts=self.experts,
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
-            # SBO args
+            usc_cache=self.usc_cache,
+            moe_index_predictor=self.moe_index_predictor,
+            predicted_topk_idx=predicted_topk_idx,
+            predicted_topk_weights=predicted_topk_weights,
+            next_layer_gate=next_layer_gate,
+            next_layer_topk=next_layer_topk,
+            layer_id=self.layer_id,
             forward_shared_experts=lambda: self._forward_shared_experts(hidden_states),
-            experts=self.experts,
             alt_stream=self.alt_stream,
         )
+        
         if sbo_shared_output is not None:
             shared_output = sbo_shared_output
+        
+        # Clean up used prediction after processing
+        if predicted_data is not None and has_predictions_attr:
+            forward_batch.next_layer_index_predictions.pop(self.layer_id, None)
 
         if shared_output is not None:
             x = shared_output
@@ -2688,6 +2742,32 @@ class DeepseekV2Model(nn.Module):
                     self.embed_tokens.embedding_dim,
                 )
             )
+        # Setup next_layer_gate references for index prediction
+        self._setup_next_layer_gates()
+
+    def _setup_next_layer_gates(self):
+        """Set up next_layer_gate and next_layer_topk for index prediction.
+        
+        Links each MoE layer to the next layer's gate and topk modules,
+        so that predictions use the exact same logic as the actual model.
+        """
+        moe_layers = []
+        for i in range(len(self.layers)):
+            if isinstance(self.layers[i].mlp, DeepseekV2MoE):
+                moe_layers.append((i, self.layers[i]))  # Store the full layer, not just MoE
+        
+        # Use object.__setattr__ to avoid PyTorch's module tracking
+        for idx, (layer_idx, layer) in enumerate(moe_layers):
+            moe = layer.mlp
+            if idx + 1 < len(moe_layers):
+                next_layer_idx, next_layer = moe_layers[idx + 1]
+                next_moe = next_layer.mlp
+                object.__setattr__(moe, 'next_layer_gate', next_moe.gate)
+                object.__setattr__(moe, 'next_layer_topk', next_moe.topk)
+            else:
+                # Last MoE layer has no next layer
+                object.__setattr__(moe, 'next_layer_gate', None)
+                object.__setattr__(moe, 'next_layer_topk', None)
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
