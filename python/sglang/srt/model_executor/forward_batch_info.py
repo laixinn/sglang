@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput, StandardCombineInput
 
 _is_npu = is_npu()
 
@@ -399,6 +400,9 @@ class ForwardBatch:
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
+
+    # For USC
+    usc_dispatch_output: Optional[StandardDispatchOutput] = None
 
     @classmethod
     def init_new(

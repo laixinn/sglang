@@ -138,6 +138,7 @@ class TopKOutputFormat(IntEnum):
     STANDARD = auto()
     TRITON_KERNEL = auto()
     BYPASSED = auto()
+    VARLEN = auto()
 
 
 @runtime_checkable
@@ -161,6 +162,17 @@ class StandardTopKOutput(NamedTuple):
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.STANDARD
 
+class VarlenTopKOutput(NamedTuple):
+    """Variable length top-k output format."""
+
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    router_logits: torch.Tensor
+    topk_m: torch.Tensor
+
+    @property
+    def format(self) -> TopKOutputFormat:
+        return TopKOutputFormat.VARLEN
 
 class TritonKernelTopKOutput(NamedTuple):
     """Triton kernel top-k output format."""

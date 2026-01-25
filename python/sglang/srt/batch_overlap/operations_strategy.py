@@ -136,6 +136,79 @@ def _compute_moe_deepseek_blog_decode(layer):
     )
 
 
+# ------------------------ Strategy for DeepSeek V3.2 Unified Sparse Cache -----------------
+
+
+# TODO can refactor to make it more fancy if we have more complex strategies
+def _compute_moe_usc_layer_operations_strategy_tbo(
+    layer: torch.nn.Module,
+    forward_mode: ForwardMode,
+) -> OperationsStrategy:
+    assert layer.is_layer_sparse, "dense layer TBO not yet implemented"
+    if forward_mode == ForwardMode.EXTEND:
+        return _compute_moe_usc_prefill(layer)
+    elif (
+        forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
+    ):
+        return _compute_moe_usc_decode(layer)
+    else:
+        raise NotImplementedError(f"Unsupported {forward_mode=}")
+
+def _compute_moe_usc_prefill_hit(layer):
+    device_properties = torch.cuda.get_device_properties(device="cuda")
+    total_num_sms = device_properties.multi_processor_count
+    deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+
+    return OperationsStrategy(
+        deep_gemm_num_sms=deep_gemm_num_sms,
+        tbo_delta_stages=0,
+        operations=[
+            layer.mlp.op_usc_estimate,
+            operations.YieldOperation(),
+            # update state by miss stream
+            layer.mlp.op_usc_hit,
+            layer.mlp.op_dispatch_a,
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            layer.mlp.op_combine_b,
+            operations.YieldOperation(),
+        ],
+    )
+
+def _compute_moe_usc_prefill_miss(layer):
+    device_properties = torch.cuda.get_device_properties(device="cuda")
+    total_num_sms = device_properties.multi_processor_count
+    deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+
+    return OperationsStrategy(
+        deep_gemm_num_sms=deep_gemm_num_sms,
+        tbo_delta_stages=0,
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
+            layer.op_comm_prepare_mlp,
+            operations.YieldOperation(), # op_usc_estimate
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            layer.mlp.op_usc_verify,
+            operations.YieldOperation(), # op_usc_hit to op_combine_b
+            layer.mlp.op_usc_miss,
+            layer.mlp.op_dispatch_a,
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            layer.mlp.op_shared_experts,
+            layer.mlp.op_combine_b,
+            operations.YieldOperation(),
+            layer.mlp.op_usc_reduce,
+            layer.mlp.op_output,
+            layer.op_comm_postprocess_layer,
+        ],
+    )
+
+
 # -------------------------------- Strategy for Qwen3 ---------------------------------------
 
 
