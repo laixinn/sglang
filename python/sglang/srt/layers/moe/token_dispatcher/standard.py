@@ -36,7 +36,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.topk import TopKOutput, VarlenTopKOutput
 
 
 try:
@@ -189,4 +189,32 @@ class StandardDispatcher(BaseDispatcher):
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
             )
+        return hidden_states
+
+class VarlenDispatcher(BaseDispatcher):
+
+    def __init__(self, moe_runner_config: MoeRunnerConfig):
+        super().__init__()
+        self.num_experts = moe_runner_config.num_experts
+        self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
+        self.num_local_routed_experts = (
+            moe_runner_config.num_local_experts - self.num_local_shared_experts
+        )
+
+    def dispatch(
+        self, hidden_states: torch.Tensor, topk_output: VarlenTopKOutput
+    ) -> StandardDispatchOutput:
+
+        hidden_states = hidden_states
+        hidden_states_scale = None
+
+        return StandardDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            topk_output=topk_output,
+        )
+
+    # TODO: support varlen ouptut and no_combine input
+    def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:
+        (hidden_states,) = combine_input
         return hidden_states

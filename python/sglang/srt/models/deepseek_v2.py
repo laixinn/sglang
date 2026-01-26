@@ -1098,20 +1098,14 @@ class DeepseekV2MoE(nn.Module):
     def op_usc_hit_b(self, state):
         self.usc_cache.hit_forward_b()
 
-    def op_usc_miss_a(self, state):
-        self.usc_cache.miss_forward_a(
+    def op_usc_miss(self, state):
+        self.usc_cache.miss_forward(
             state=state,
             experts=self.experts,
         )
 
-    def op_usc_miss_b(self, state):
-        self.usc_cache.miss_forward_b()
-
     def op_usc_reduce(self, state):
-        state.hidden_states_after_combine = self.usc_cache.reduce(
-            hit_results=state.pop("hit_hidden_states_after_combine"),
-            miss_results=state.pop("miss_hidden_states_after_combine"),
-        )
+        state.hidden_states_after_combine = self.usc_cache.reduce(state)
         state.pop("estimated_topk")
         state.pop("estimated_router")
 

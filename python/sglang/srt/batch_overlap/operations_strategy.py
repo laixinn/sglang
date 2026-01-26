@@ -180,18 +180,20 @@ def _compute_moe_usc_prefill(layer):
             layer.self_attn.op_prepare,
             layer.self_attn.op_core,
             layer.op_comm_prepare_mlp,
+            
+            layer.mlp.op_usc_estimate_b, # estimated topk is ready
+            layer.mlp.op_usc_hit_a,  # overlap hit forward with op_gate+op_select_experts
+
             layer.mlp.op_gate,
             layer.mlp.op_select_experts,
-            # sync
-            layer.mlp.op_usc_estimate_b,
-            layer.mlp.op_usc_verify,
-            layer.mlp.op_usc_hit_a,
-            layer.mlp.op_usc_miss_a,
-            layer.mlp.op_usc_hit_b,
-            layer.mlp.op_usc_miss_b,
-            # sync
-            layer.mlp.op_usc_reduce,
-            layer.mlp.op_usc_estimate_a,
+            
+            layer.mlp.op_usc_verify, # sync: use true and estimated topk
+
+            layer.mlp.op_usc_miss,   # get partial true topk results
+            layer.mlp.op_usc_hit_b,  # get full estimated topk results
+            layer.mlp.op_usc_reduce, # sync: take partial hit results, combine and then reduce
+
+            layer.mlp.op_usc_estimate_a, # launch topk estimation, old results have been cleaned
             layer.mlp.op_output,
             layer.op_comm_postprocess_layer,
         ],

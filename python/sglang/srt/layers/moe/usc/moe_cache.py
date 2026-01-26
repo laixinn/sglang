@@ -640,53 +640,58 @@ class USCTPMoECache(DecodeCache):
         experts: FusedMoE,
     ):
         with torch.cuda.stream(self.alt_stream):
-            topk_output = self._get_hit_cache(
-                state.estimated_topk, state.pop("hit_mask")
-            )
             dispatch_output = experts.dispatcher.dispatch(
                 hidden_states=state.hidden_states_mlp_input,
-                topk_output=topk_output,
+                topk_output=state.estimated_topk,
             )
+            # TODO: no_combine output with all topk computed
             combine_input = experts.run_moe_core(
                 dispatch_output=dispatch_output,
             )
-            state.miss_hidden_states_after_combine = experts.dispatcher.combine(
+            # varlen combine output
+            state.hit_varlen_combine_output = experts.dispatcher.combine(
                 combine_input=combine_input,
             )
 
     def hit_forward_b(self):
         torch.cuda.current_stream().wait_stream(self.alt_stream)
 
-    def miss_forward_a(
+    def miss_forward(
         self, 
         state: _StateDict,
         experts: FusedMoE,
         num_fused_shared_experts: int,
         shared_experts: torch.nn.Module,
     ):
-        with torch.cuda.stream(self.alt_stream):
-            topk_output = self._get_miss_cache(
-                state.estimated_topk, state.pop("miss_mask")
-            )
-            dispatch_output = experts.dispatcher.dispatch(
-                hidden_states=state.hidden_states_mlp_input,
-                topk_output=topk_output,
-            )
-            combine_input = experts.run_moe_core(
-                dispatch_output=dispatch_output,
-            )
-            state.miss_hidden_states_after_combine = experts.dispatcher.combine(
-                combine_input=combine_input,
-            )
-            if (num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
-                state.forward_batch.forward_mode, state.hidden_states_mlp_input
-            ):
-                state.shared_output = shared_experts(state.hidden_states_mlp_input)
-            else:
-                state.shared_output = None
+        topk_output = self._get_miss_cache(
+            state.estimated_topk, state.pop("miss_mask")
+        )
+        dispatch_output = experts.dispatcher.dispatch(
+            hidden_states=state.hidden_states_mlp_input,
+            topk_output=topk_output,
+        )
+        # support varlen topk moe
+        combine_input = experts.run_moe_core(
+            dispatch_output=dispatch_output,
+        )
+        # standard combine output with topk=-1 positions excluded from combine
+        state.miss_varlen_combine_output = experts.dispatcher.combine(
+            combine_input=combine_input,
+        )
+        if (num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+        ):
+            state.shared_output = shared_experts(state.hidden_states_mlp_input)
+        else:
+            state.shared_output = None
 
-    def miss_forward_b(self):
-        torch.cuda.current_stream().wait_stream(self.alt_stream)
+    def reduce(self, state: _StateDict):
+        # TODO: get hit ones, miss ones, then reduce
+        hit_combine = state.hit_varlen_combine_output
+        miss_combine = state.miss_varlen_combine_output
 
-    def reduce(self, hit_results, miss_results):
+        # TODO: get hit and miss ones
+
+
+        # reduce
         return hit_results + miss_results
