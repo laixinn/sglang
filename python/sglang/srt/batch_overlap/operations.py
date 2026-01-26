@@ -57,44 +57,6 @@ def execute_overlapped_operations(
     assert executor_a.done and executor_b.done
     return [executor_a.output, executor_b.output]
 
-def execute_usc_operations(
-    inputs, operations_arr
-) -> Sequence:
-    # Make it explicit for clarity; if we need multi-batch overlap, this can be generalized
-    operations_hit, operations_miss = operations_arr
-
-    operations_hit = _convert_operations_to_stages(operations_hit)
-    operations_miss = _convert_operations_to_stages(operations_miss)
-    executor_hit = _StageExecutor("hit", operations_hit, inputs=inputs)
-    executor_miss = _StageExecutor("miss", operations_miss, inputs=inputs)
-
-    # TODO: check first layer
-
-    # get first attn results
-    executor_miss.next()
-
-    for _ in range(executor_miss.num_stages):
-        # TODO: check sequential execution except for hit and miss
-
-        # estimate
-        executor_hit._stage_state.copy_from(executor_miss._stage_state)
-        executor_hit.next()
-
-        # verify
-        executor_miss.next()
-
-        # hit and miss results
-        # TODO: parallelism
-        executor_hit.next()
-        executor_miss.next()
-
-        # reduce and next attn results
-        executor_miss._stage_state.update({"hit_hidden_states_after_combine": executor_hit._stage_state.hidden_states_after_combine})
-        executor_miss.next()
-
-    assert executor_miss.done and executor_hit.done
-    return [executor_miss.output]
-
 
 class YieldOperation:
     pass
@@ -111,7 +73,7 @@ Stage = List[ExecutionOperation]
 
 
 class _StageExecutor:
-    def __init__(self, debug_name: str, stages: List[Stage], inputs: dict):
+    def __init__(self, debug_name: str, stages: List[Stage], inputs: dict, usc_mode: bool = False):
         self._debug_name = debug_name
         self._stages = stages
         self._index = 0
@@ -125,6 +87,8 @@ class _StageExecutor:
         self._global_num_tokens = forward_batch.global_num_tokens_cpu
         self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
 
+        self.usc_mode = usc_mode
+
     def next(self):
         assert not self.done
 
@@ -133,12 +97,13 @@ class _StageExecutor:
         # TODO: We currently always call set_dp_buffer_len here because sub-batches
         # may have different padded lengths. It can likely be removed after TBO slice &
         # pad logic is refactored.
-        set_dp_buffer_len(
-            self._global_dp_buffer_len,
-            self._local_dp_buffer_len,
-            self._is_dp_max_padding,
-            self._global_num_tokens,
-        )
+        if not self.usc_mode:
+            set_dp_buffer_len(
+                self._global_dp_buffer_len,
+                self._local_dp_buffer_len,
+                self._is_dp_max_padding,
+                self._global_num_tokens,
+            )
 
         with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
             for op in stage:
@@ -213,9 +178,6 @@ class _StateDict:
 
         self._data.clear()
 
-    def copy_from(self, other: _StateDict):
-        for key, val in other._data.items():
-            self._data[key] = val
 
 def _convert_operations_to_stages(operations: List[Operation]) -> List[Stage]:
     operations = _decorate_operations(operations)

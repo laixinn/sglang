@@ -175,9 +175,7 @@ from sglang.srt.utils import (
 from sglang.srt.layers.moe.usc.moe_cache import (
     USCMoECache, USCTPMoECache
 )
-from sglang.srt.layers.moe.usc.index_estimator import (
-    MoEIndexPredictor,
-)
+from sglang.srt.layers.moe.utils import is_usc_enabled
 
 if _use_aiter_gfx95:
 
@@ -592,17 +590,11 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
-        if get_bool_env_var("SGLANG_ENABLE_USC", "false"):
-            try:
-                if get_moe_a2a_backend().is_deepep():
-                    pass
-                else:
-                    self.usc_cache = USCTPMoECache(
-                        dispatcher=self.experts.dispatcher,
-                    )
-                self.moe_index_predictor = MoEIndexPredictor()
-            except Exception as e:
-                raise ValueError(f"[USCMoECache] Failed to initialize for layer {layer_id}: {e}")
+        if is_usc_enabled():
+            if get_moe_a2a_backend().is_deepep():
+                pass
+            else:
+                self.usc_cache = USCTPMoECache()
 
     def get_moe_weights(self):
         return [
@@ -1074,47 +1066,54 @@ class DeepseekV2MoE(nn.Module):
 
         state.hidden_states_mlp_output = final_hidden_states
 
-    # TODO: check miss/hit empty
-    def op_usc_estimate(self, state):
-        if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
-        ):
-            # router_logits: (num_tokens, n_experts)
-            state.estimtated_router = self.next_layer_gate(state.hidden_states_mlp_input)
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.estimated_topk = self.next_layer_topk(
-                    hidden_states=state.hidden_states_mlp_input,
-                    router_logits=state.estimated_router,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
-                )
-        else:
-            state.estimated_router = None
-            state.estimated_topk = self.topk.empty_topk_output(state.hidden_states_mlp_input.device)
+    def op_usc_estimate_a(self, state):
+        self.usc_cache.index_estimate_a(
+            state=state,
+            has_usc_estimation=self.has_usc_estimation,
+            layer_id=self.layer_id,
+            topk=self.topk,
+            next_layer_gate=self.next_layer_gate,
+            next_layer_topk=self.next_layer_topk,
+        )
+
+    def op_usc_estimate_b(self, state):
+        self.usc_cache.index_estimate_b()
 
     def op_usc_verify(self, state):
-        # Succeeding op_select_experts
+        # For first layer, estimated_topk is all -1 and hit_mask is all False
+        estimated_topk = state.get("estimated_topk")
+        if estimated_topk is None:
+            state.estimated_topk = self.topk.empty_topk_output(state.hidden_states_mlp_input.device)
+            state.estimated_router = None
         state.hit_mask, state.miss_mask = self.usc_cache._verify_cache(
-            state.topk_output, state.estimated_topk
+            state.topk_output, estimated_topk
         )
 
-    def op_usc_hit(self, state):
-        state.topk_output = self.usc_cache._get_hit_cache(
-            state.pop("estimated_topk"), state.pop("hit_mask")
+    def op_usc_hit_a(self, state):
+        self.usc_cache.hit_forward_a(
+            state=state,
+            experts=self.experts,
         )
 
-    def op_usc_miss(self, state):
-        state.topk_output = self.usc_cache._get_miss_cache(
-            state.topk_output, state.pop("miss_mask")
+    def op_usc_hit_b(self, state):
+        self.usc_cache.hit_forward_b()
+
+    def op_usc_miss_a(self, state):
+        self.usc_cache.miss_forward_a(
+            state=state,
+            experts=self.experts,
         )
+
+    def op_usc_miss_b(self, state):
+        self.usc_cache.miss_forward_b()
 
     def op_usc_reduce(self, state):
-        if (hit_output := state.pop("hit_hidden_states_after_combine")) is not None:
-            state.hidden_states_after_combine += hit_output
+        state.hidden_states_after_combine = self.usc_cache.reduce(
+            hit_results=state.pop("hit_hidden_states_after_combine"),
+            miss_results=state.pop("miss_hidden_states_after_combine"),
+        )
+        state.pop("estimated_topk")
+        state.pop("estimated_router")
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -3072,7 +3071,7 @@ class DeepseekV2Model(nn.Module):
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
         # Setup next_layer_gate references for index prediction
-        if get_bool_env_var("SGLANG_ENABLE_USC", "false"):
+        if is_usc_enabled():
             self._setup_next_layer_gates()
 
     def _setup_next_layer_gates(self):
@@ -3155,7 +3154,7 @@ class DeepseekV2Model(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo:
+        if forward_batch.can_run_tbo or is_usc_enabled():
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer

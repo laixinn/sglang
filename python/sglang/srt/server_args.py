@@ -555,6 +555,7 @@ class ServerArgs:
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
+    enable_usc: bool = False
     enable_torch_compile: bool = False
     enable_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
@@ -4171,6 +4172,11 @@ class ServerArgs:
             "--enable-two-batch-overlap",
             action="store_true",
             help="Enabling two micro batches to overlap.",
+        )
+        parser.add_argument(
+            "--enable-usc",
+            action="store_true",
+            help="Enabling Unified Sparse Cache (USC) for prefill.",
         )
         parser.add_argument(
             "--enable-single-batch-overlap",

@@ -26,6 +26,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_tbo_token_distribution_threshold,
     is_tbo_enabled,
+    is_usc_enabled,
 )
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
@@ -827,12 +828,15 @@ def model_forward_maybe_tbo(
         layers, forward_batch.global_forward_mode
     )
     if enable_tbo:
-        return _model_forward_tbo(
-            inputs=inputs,
-            operations_strategy=operations_strategy,
-            input_data_scatter_mode=input_data_scatter_mode,
-            layer_input_scatter_mode=layer_input_scatter_mode,
-        )
+        if is_usc_enabled():
+            return _model_forward_non_tbo(inputs, operations_strategy)
+        else:
+            return _model_forward_tbo(
+                inputs=inputs,
+                operations_strategy=operations_strategy,
+                input_data_scatter_mode=input_data_scatter_mode,
+                layer_input_scatter_mode=layer_input_scatter_mode,
+            )
     else:
         return _model_forward_non_tbo(inputs, operations_strategy)
 

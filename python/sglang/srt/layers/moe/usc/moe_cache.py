@@ -10,18 +10,18 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 from sglang.srt.layers.moe.usc.decode_cache import DecodeCache
 
-from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
-from sglang.srt.layers.moe.token_dispatcher.standard import (
-    StandardDispatchOutput, 
-    StandardCombineInput,
-)
+from sglang.srt.batch_overlap.operations import _StateDict
+from sglang.srt.utils import is_non_idle_and_non_empty
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.moe.topk import VarlenTopKOutput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import (
+        TopK,
         TopKOutput, 
-        VarlenTopKOutput, 
-        TopKOutputFormat,
     )
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
 class USCMoECache(DecodeCache):
     def __init__(
@@ -525,81 +525,25 @@ class USCMoECache(DecodeCache):
         return shuffle_idx, masked_m
 
 class USCTPMoECache(DecodeCache):
-    def __init__(
-        self,
-        dispatcher: BaseDispatcher,
-    ):
+    def __init__(self):
         super().__init__()
-        self.dispatcher = dispatcher
-        
-        # cache params
-        self.dispatch_result = None
 
-    def get_dispatch_result(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-        cache_topk_output: TopKOutput,
-        correction: bool = True,
-    ) -> StandardDispatchOutput:
-        # verify
-        hit_mask, miss_mask = self._verify_cache(topk_output, cache_topk_output)
-
-        self.hit_global_results = self._get_hit_cache(hit_mask, cache_topk_output)
-
-        miss_local_results = self._get_miss_cache(hidden_states, topk_output, miss_mask)
-
-        # correction - this calls dispatch_decode for miss tokens
-        self.miss_global_results = self.dispatch_decode(*miss_local_results)
-
-        if correction:
-            # TODO: combine after computation
-            scatter_results = self._correction(self.hit_global_results, self.miss_global_results)
-
-            return scatter_results
-        else:
-            return self.miss_global_results
-
-    def dispatch_decode(
-        self,
-        hidden_states: torch.Tensor, 
-        topk_output: TopKOutput,
-    ) -> StandardDispatchOutput:
-        dispatch_output: StandardDispatchOutput = self.dispatcher.dispatch(hidden_states, topk_output)
-
-        if topk_output.format != TopKOutputFormat.VARLEN:
-            topk_m = torch.full((topk_output.topk_idx.shape[0],), topk_output.topk_idx.shape[1], dtype=torch.int32, device=topk_output.topk_idx.device)
-
-        topk_output = dispatch_output.topk_output
-        dispatch_output.topk_output = VarlenTopKOutput(
-            topk_weights=topk_output.topk_weights,
-            topk_ids=topk_output.topk_ids,
-            router_logits=topk_output.router_logits,
-            topk_m=topk_m,
-        )
-        
-        return dispatch_output
-
-    def combine_decode(
-        self,
-        combine_input: StandardCombineInput,
-    ):
-        return self.dispatcher.combine(combine_input)
+        self.alt_stream = torch.cuda.Stream()
 
     def _verify_cache(
         self,
         topk_output: TopKOutput,
         cache_topk_output: Optional[TopKOutput] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        topk_idx = topk_output.topk_idx
+        topk_idx = topk_output.topk_ids
 
         # reset recall
         # TODO: CHECK THIS
         self._last_tp = 0
         self._last_fn = 0
 
-        if cache_topk_output is None:
-            cache_topk_idx = cache_topk_output.topk_idx
+        if cache_topk_output is not None:
+            cache_topk_idx = cache_topk_output.topk_ids
             hit_token_mask = torch.zeros_like(topk_idx, dtype=torch.bool)
             miss_token_mask = torch.zeros_like(topk_idx, dtype=torch.bool)
 
@@ -619,8 +563,41 @@ class USCTPMoECache(DecodeCache):
 
         return hit_token_mask, miss_token_mask
 
+    def index_estimate_a(
+        self, 
+        state: _StateDict, 
+        has_usc_estimation: bool,
+        layer_id: int,
+        topk: TopK,
+        next_layer_gate: Callable,
+        next_layer_topk: Callable,
+    ):
+        with torch.cuda.stream(self.alt_stream):
+            if is_non_idle_and_non_empty(
+                state.forward_batch.forward_mode, state.hidden_states_mlp_input
+            ) and has_usc_estimation:
+                # router_logits: (num_tokens, n_experts)
+                state.estimated_router = next_layer_gate(state.hidden_states_mlp_input)
+                with get_global_expert_distribution_recorder().with_current_layer(
+                    layer_id
+                ):
+                    state.estimated_topk = next_layer_topk(
+                        hidden_states=state.hidden_states_mlp_input,
+                        router_logits=state.estimated_router,
+                        num_token_non_padded=state.forward_batch.num_token_non_padded,
+                        expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                            layer_id=layer_id,
+                        ),
+                    )
+            else:
+                state.estimated_router = None
+                state.estimated_topk = topk.empty_topk_output(state.hidden_states_mlp_input.device)
+
+    def index_estimate_b(self):
+        torch.cuda.current_stream().wait_stream(self.alt_stream)
+
     def _get_hit_cache(self, cache_topk_output: TopKOutput, hit_mask: torch.Tensor):
-        topk_idx = cache_topk_output.topk_idx
+        topk_idx = cache_topk_output.topk_ids
 
         hit_token_mask = hit_mask
 
@@ -640,7 +617,7 @@ class USCTPMoECache(DecodeCache):
         )
 
     def _get_miss_cache(self, topk_output: TopKOutput, miss_mask: torch.Tensor):
-        topk_idx = topk_output.topk_idx
+        topk_idx = topk_output.topk_ids
 
         miss_token_mask = miss_mask
         miss_topk_m = miss_token_mask.sum(dim=1)
@@ -657,35 +634,59 @@ class USCTPMoECache(DecodeCache):
                 topk_m=miss_topk_m,
             )
 
-    def _correction(self, hit_results, miss_results):
-        cache_topk_m = miss_results.topk_m
-        cache_topk_idx = miss_results.topk_idx
+    def hit_forward_a(
+        self, 
+        state: _StateDict,
+        experts: FusedMoE,
+    ):
+        with torch.cuda.stream(self.alt_stream):
+            topk_output = self._get_hit_cache(
+                state.estimated_topk, state.pop("hit_mask")
+            )
+            dispatch_output = experts.dispatcher.dispatch(
+                hidden_states=state.hidden_states_mlp_input,
+                topk_output=topk_output,
+            )
+            combine_input = experts.run_moe_core(
+                dispatch_output=dispatch_output,
+            )
+            state.miss_hidden_states_after_combine = experts.dispatcher.combine(
+                combine_input=combine_input,
+            )
 
-        hit_topk_idx = hit_results.topk_ids
-        hit_topk_m = hit_results.topk_m
+    def hit_forward_b(self):
+        torch.cuda.current_stream().wait_stream(self.alt_stream)
 
-        num_topk = cache_topk_idx.shape[1]
-        assert torch.allclose(cache_topk_m, num_topk - hit_topk_m)
+    def miss_forward_a(
+        self, 
+        state: _StateDict,
+        experts: FusedMoE,
+        num_fused_shared_experts: int,
+        shared_experts: torch.nn.Module,
+    ):
+        with torch.cuda.stream(self.alt_stream):
+            topk_output = self._get_miss_cache(
+                state.estimated_topk, state.pop("miss_mask")
+            )
+            dispatch_output = experts.dispatcher.dispatch(
+                hidden_states=state.hidden_states_mlp_input,
+                topk_output=topk_output,
+            )
+            combine_input = experts.run_moe_core(
+                dispatch_output=dispatch_output,
+            )
+            state.miss_hidden_states_after_combine = experts.dispatcher.combine(
+                combine_input=combine_input,
+            )
+            if (num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
+                state.forward_batch.forward_mode, state.hidden_states_mlp_input
+            ):
+                state.shared_output = shared_experts(state.hidden_states_mlp_input)
+            else:
+                state.shared_output = None
 
-        M = cache_topk_idx.shape[0]
-        topk_idx = torch.zeros_like(cache_topk_idx)
-        for i in range(M):
-            if cache_topk_m[i] > 0:
-                topk_idx[i, :cache_topk_m[i]] = cache_topk_idx[i, :cache_topk_m[i]]
-            if hit_topk_m[i] > 0:
-                topk_idx[i, cache_topk_m[i]:] = hit_topk_idx[i, :hit_topk_m[i]]
+    def miss_forward_b(self):
+        torch.cuda.current_stream().wait_stream(self.alt_stream)
 
-        return StandardDispatchOutput(
-            hidden_states=miss_results.hidden_states,
-            hidden_states_scale=miss_results.hidden_states_scale,
-            topk_output=TopKOutput(
-                topk_idx=topk_idx,
-                topk_weights=miss_results.topk_output.topk_weights,
-                router_logits=miss_results.topk_output.router_logits,
-            ),
-        )
-
-    def _empty_cache(self):
-        if self.dispatch_result is not None:
-            del self.dispatch_result
-            self.dispatch_result = None
+    def reduce(self, hit_results, miss_results):
+        return hit_results + miss_results

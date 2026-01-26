@@ -7,6 +7,7 @@ from sglang.srt.batch_overlap import operations
 from sglang.srt.batch_overlap.operations import Operation
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.layers.moe.utils import is_usc_enabled
 
 
 @dataclass
@@ -34,14 +35,24 @@ class OperationsStrategy:
     ) -> "OperationsStrategy":
         layer_name = layers[0].__class__.__name__
         if layer_name == "DeepseekV2DecoderLayer":
-            return OperationsStrategy.concat(
-                [
-                    _compute_moe_deepseek_layer_operations_strategy_tbo(
-                        layer, forward_mode
-                    )
-                    for layer in layers
-                ]
-            )
+            if is_usc_enabled():
+                return OperationsStrategy.concat(
+                    [
+                        _compute_moe_usc_layer_operations_strategy_tbo(
+                            layer, forward_mode, 0
+                        )
+                        for layer in layers
+                    ]
+                )
+            else:
+                return OperationsStrategy.concat(
+                    [
+                        _compute_moe_deepseek_layer_operations_strategy_tbo(
+                            layer, forward_mode
+                        )
+                        for layer in layers
+                    ]
+                )
         elif layer_name == "Qwen3MoeDecoderLayer":
             return OperationsStrategy.concat(
                 [
@@ -150,37 +161,17 @@ def _compute_moe_usc_layer_operations_strategy_tbo(
     elif (
         forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
     ):
-        return _compute_moe_usc_decode(layer)
+        # TODO: with attn, this prefill strategy might not be applicable to decode
+        return _compute_moe_usc_prefill(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
 
-def _compute_moe_usc_prefill_hit(layer):
+def _compute_moe_usc_prefill(layer):
     device_properties = torch.cuda.get_device_properties(device="cuda")
     total_num_sms = device_properties.multi_processor_count
     deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
 
-    return OperationsStrategy(
-        deep_gemm_num_sms=deep_gemm_num_sms,
-        tbo_delta_stages=0,
-        operations=[
-            layer.mlp.op_usc_estimate,
-            operations.YieldOperation(),
-            # update state by miss stream
-            layer.mlp.op_usc_hit,
-            layer.mlp.op_dispatch_a,
-            layer.mlp.op_dispatch_b,
-            layer.mlp.op_experts,
-            layer.mlp.op_combine_a,
-            layer.mlp.op_combine_b,
-            operations.YieldOperation(),
-        ],
-    )
-
-def _compute_moe_usc_prefill_miss(layer):
-    device_properties = torch.cuda.get_device_properties(device="cuda")
-    total_num_sms = device_properties.multi_processor_count
-    deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
-
+    # TODO: add YieldOperation
     return OperationsStrategy(
         deep_gemm_num_sms=deep_gemm_num_sms,
         tbo_delta_stages=0,
@@ -189,20 +180,18 @@ def _compute_moe_usc_prefill_miss(layer):
             layer.self_attn.op_prepare,
             layer.self_attn.op_core,
             layer.op_comm_prepare_mlp,
-            operations.YieldOperation(), # op_usc_estimate
             layer.mlp.op_gate,
             layer.mlp.op_select_experts,
+            # sync
+            layer.mlp.op_usc_estimate_b,
             layer.mlp.op_usc_verify,
-            operations.YieldOperation(), # op_usc_hit to op_combine_b
-            layer.mlp.op_usc_miss,
-            layer.mlp.op_dispatch_a,
-            layer.mlp.op_dispatch_b,
-            layer.mlp.op_experts,
-            layer.mlp.op_combine_a,
-            layer.mlp.op_shared_experts,
-            layer.mlp.op_combine_b,
-            operations.YieldOperation(),
+            layer.mlp.op_usc_hit_a,
+            layer.mlp.op_usc_miss_a,
+            layer.mlp.op_usc_hit_b,
+            layer.mlp.op_usc_miss_b,
+            # sync
             layer.mlp.op_usc_reduce,
+            layer.mlp.op_usc_estimate_a,
             layer.mlp.op_output,
             layer.op_comm_postprocess_layer,
         ],
