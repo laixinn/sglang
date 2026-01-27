@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Optional, Dict, Any, Callable, Tuple
+from contextlib import contextmanager
+
 import torch
 import torch.distributed as dist
 
@@ -11,17 +14,38 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.layers.moe.usc.decode_cache import DecodeCache
 
 from sglang.srt.batch_overlap.operations import _StateDict
-from sglang.srt.utils import is_non_idle_and_non_empty
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.moe.topk import VarlenTopKOutput
+from sglang.srt.layers.moe.topk import VarlenTopKOutput, StandardTopKOutput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import (
-        TopK,
         TopKOutput, 
     )
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe import MoeRunner
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+
+@contextmanager
+def override_moe_config(runner: MoeRunner, config: MoeRunnerConfig):
+    old_config = runner.config
+    runner.config = config
+    try:
+        yield
+    finally:
+        runner.config = old_config
+
+
+class StreamTensorWrapper:
+    def __init__(self, tensor: torch.Tensor, event: torch.cuda.Event):
+        self.tensor = tensor
+        self.event = event
+
+    def get_tensor(self):
+        if not self.event.query():
+            self.event.synchronize()
+        return self.tensor
+
 
 class USCMoECache(DecodeCache):
     def __init__(
@@ -525,8 +549,14 @@ class USCMoECache(DecodeCache):
         return shuffle_idx, masked_m
 
 class USCTPMoECache(DecodeCache):
-    def __init__(self):
+    def __init__(self, experts: FusedMoE):
         super().__init__()
+
+        # hit moe runner
+        self.hit_moe_runner_config = replace(experts.moe_runner_config, no_combine=True, inplace=False)
+        self.experts = experts
+
+        # miss moe runner
 
         self.alt_stream = torch.cuda.Stream()
 
@@ -563,39 +593,6 @@ class USCTPMoECache(DecodeCache):
 
         return hit_token_mask, miss_token_mask
 
-    def index_estimate_a(
-        self, 
-        state: _StateDict, 
-        has_usc_estimation: bool,
-        layer_id: int,
-        topk: TopK,
-        next_layer_gate: Callable,
-        next_layer_topk: Callable,
-    ):
-        with torch.cuda.stream(self.alt_stream):
-            if is_non_idle_and_non_empty(
-                state.forward_batch.forward_mode, state.hidden_states_mlp_input
-            ) and has_usc_estimation:
-                # router_logits: (num_tokens, n_experts)
-                state.estimated_router = next_layer_gate(state.hidden_states_mlp_input)
-                with get_global_expert_distribution_recorder().with_current_layer(
-                    layer_id
-                ):
-                    state.estimated_topk = next_layer_topk(
-                        hidden_states=state.hidden_states_mlp_input,
-                        router_logits=state.estimated_router,
-                        num_token_non_padded=state.forward_batch.num_token_non_padded,
-                        expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                            layer_id=layer_id,
-                        ),
-                    )
-            else:
-                state.estimated_router = None
-                state.estimated_topk = topk.empty_topk_output(state.hidden_states_mlp_input.device)
-
-    def index_estimate_b(self):
-        torch.cuda.current_stream().wait_stream(self.alt_stream)
-
     def _get_hit_cache(self, cache_topk_output: TopKOutput, hit_mask: torch.Tensor):
         topk_idx = cache_topk_output.topk_ids
 
@@ -627,63 +624,75 @@ class USCTPMoECache(DecodeCache):
             if miss_topk_m[i] > 0:
                 miss_topk_idx[i, :miss_topk_m[i]] = topk_idx[i, miss_token_mask[i]]
 
-        return VarlenTopKOutput(
-                topk_weights=topk_output.topk_weights,
-                topk_ids=miss_topk_idx,
-                router_logits=topk_output.router_logits,
-                topk_m=miss_topk_m,
-            )
+        # return VarlenTopKOutput(
+        #         topk_weights=topk_output.topk_weights,
+        #         topk_ids=miss_topk_idx,
+        #         router_logits=topk_output.router_logits,
+        #         topk_m=miss_topk_m,
+        #     )
 
-    def hit_forward_a(
+        # hit mask is separated
+        return StandardTopKOutput(
+            topk_weights=topk_output.topk_weights,
+            topk_ids=miss_topk_idx,
+            router_logits=topk_output.router_logits,
+        )
+    
+    def index_estimate_a(
         self, 
         state: _StateDict,
-        experts: FusedMoE,
+        index_estimate_fn: Callable,
+        forward_mode: ForwardMode,
+        hidden_states: torch.Tensor,
+        num_token_non_padded: torch.Tensor,
     ):
+        estimate_event = torch.cuda.Event()
         with torch.cuda.stream(self.alt_stream):
-            dispatch_output = experts.dispatcher.dispatch(
-                hidden_states=state.hidden_states_mlp_input,
-                topk_output=state.estimated_topk,
-            )
-            # TODO: no_combine output with all topk computed
-            combine_input = experts.run_moe_core(
-                dispatch_output=dispatch_output,
-            )
-            # varlen combine output
-            state.hit_varlen_combine_output = experts.dispatcher.combine(
-                combine_input=combine_input,
-            )
+            state.estimated_router, state.estimated_topk = \
+                index_estimate_fn(forward_mode, hidden_states, num_token_non_padded)
+            estimate_event.record()
+        return estimate_event
 
-    def hit_forward_b(self):
-        torch.cuda.current_stream().wait_stream(self.alt_stream)
+    def index_estimate_b(self, estimate_event: torch.cuda.Event):
+        torch.cuda.current_stream().wait_event(estimate_event)
+
+    def hit_forward_a(
+        self,
+        experts: FusedMoE,
+        hidden_states: torch.Tensor,
+        estimated_topk: TopKOutput,
+    ):
+        self.alt_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.alt_stream):
+            with override_moe_config(experts.quant_method.runner, self.hit_moe_runner_config):
+                hit_varlen_combine_output = experts(
+                    hidden_states=hidden_states,
+                    topk_output=estimated_topk,
+                )
+                hit_event = self.alt_stream.record_event()
+        return StreamTensorWrapper(hit_varlen_combine_output, hit_event)
+
+    def hit_forward_b(self, wrapped_tensor: StreamTensorWrapper):
+        return wrapped_tensor.get_tensor()
 
     def miss_forward(
         self, 
         state: _StateDict,
         experts: FusedMoE,
-        num_fused_shared_experts: int,
-        shared_experts: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        estimated_topk: TopKOutput,
+        miss_mask: torch.Tensor,
     ):
         topk_output = self._get_miss_cache(
-            state.estimated_topk, state.pop("miss_mask")
+            estimated_topk, miss_mask
         )
-        dispatch_output = experts.dispatcher.dispatch(
-            hidden_states=state.hidden_states_mlp_input,
+
+        # support varlen topk moe
+        # standard combine output with topk=-1 positions excluded from combine
+        state.miss_varlen_combine_output = experts(
+            hidden_states=hidden_states,
             topk_output=topk_output,
         )
-        # support varlen topk moe
-        combine_input = experts.run_moe_core(
-            dispatch_output=dispatch_output,
-        )
-        # standard combine output with topk=-1 positions excluded from combine
-        state.miss_varlen_combine_output = experts.dispatcher.combine(
-            combine_input=combine_input,
-        )
-        if (num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
-        ):
-            state.shared_output = shared_experts(state.hidden_states_mlp_input)
-        else:
-            state.shared_output = None
 
     def reduce(self, state: _StateDict):
         # TODO: get hit ones, miss ones, then reduce

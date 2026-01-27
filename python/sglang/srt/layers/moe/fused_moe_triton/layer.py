@@ -173,6 +173,7 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
+        filter_expert: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -234,6 +235,7 @@ class FusedMoE(torch.nn.Module):
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit,
             is_gated=is_gated,
+            filter_expert=filter_expert,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None

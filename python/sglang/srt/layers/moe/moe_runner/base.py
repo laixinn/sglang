@@ -44,6 +44,8 @@ class MoeRunnerConfig:
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
 
+    filter_expert: bool = True
+
 
 @dataclass
 class RunnerInput(ABC):

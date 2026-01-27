@@ -205,7 +205,8 @@ def fused_experts(
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
-        moe_runner_config.num_experts is None
+        moe_runner_config.filter_expert
+        or moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
     if moe_runner_config.inplace:
