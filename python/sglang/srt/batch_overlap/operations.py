@@ -81,11 +81,12 @@ class _StageExecutor:
         self._stage_output = inputs
 
         # handling DP attention
-        forward_batch: ForwardBatch = inputs["forward_batch"]
-        self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
-        self._local_dp_buffer_len = forward_batch.tbo_padded_len
-        self._global_num_tokens = forward_batch.global_num_tokens_cpu
-        self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
+        if not usc_mode:
+            forward_batch: ForwardBatch = inputs["forward_batch"]
+            self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
+            self._local_dp_buffer_len = forward_batch.tbo_padded_len
+            self._global_num_tokens = forward_batch.global_num_tokens_cpu
+            self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
 
         self.usc_mode = usc_mode
 

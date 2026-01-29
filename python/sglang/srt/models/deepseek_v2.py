@@ -1144,9 +1144,11 @@ class DeepseekV2MoE(nn.Module):
             and not state.pop("should_allreduce_fusion")
             and not state.pop("use_reduce_scatter")
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            reduced_final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        else:
+            reduced_final_hidden_states = final_hidden_states
 
-        state.hidden_states_mlp_output = final_hidden_states
+        state.hidden_states_mlp_output = reduced_final_hidden_states
         state.pop("hidden_states_mlp_input")
 
     def usc_index_estimate(self, forward_mode, hidden_states, num_token_non_padded):
@@ -1155,17 +1157,7 @@ class DeepseekV2MoE(nn.Module):
         ) and self.has_usc_estimation:
             # router_logits: (num_tokens, n_experts)
             estimated_router = self.next_layer_gate(hidden_states)
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                estimated_topk = self.next_layer_topk(
-                    hidden_states=hidden_states,
-                    router_logits=estimated_router,
-                    num_token_non_padded=num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
-                )
+            estimated_topk = self.next_layer_topk(hidden_states, estimated_router)
         else:
             estimated_topk = self.topk.full_topk_output(hidden_states.device, hidden_states.shape[0], True)
 
@@ -3281,7 +3273,7 @@ class DeepseekV2Model(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo or is_usc_enabled():
+        if forward_batch.can_run_tbo or (is_usc_enabled() and forward_batch.forward_mode.is_decode()):
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer

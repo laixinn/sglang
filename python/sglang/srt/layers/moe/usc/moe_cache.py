@@ -6,6 +6,8 @@ from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPDispatcher
 from sglang.srt.layers.moe.utils import DeepEPMode
@@ -35,6 +37,147 @@ def override_moe_config(runner: MoeRunner, config: MoeRunnerConfig):
         yield
     finally:
         runner.config = old_config
+
+# fork from https://github.com/chang-l/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/multi_stream_utils.py#L35
+def maybe_execute_in_parallel(
+        fn0: Callable,
+        fn1: Callable,
+        event0: torch.cuda.Event,
+        event1: torch.cuda.Event,
+        aux_stream: Optional[torch.cuda.Stream] = None) -> tuple[Any, Any]:
+    """Utility function to run two functions in two cuda streams in parallel. Multi-stream is
+    only enabled when cuda graph is turned on because switch stream has extra host overhead.
+
+    This design is mainly for low latency use case. It needs to be improved for max throughput
+    use case.
+    For simplicity, fn0 and fn1 do not support inputs.
+
+    Args:
+        fn0 (Callable): callable for the default stream
+        fn1 (Callable): callable for the second stream, aux_stream
+        event0 (torch.cuda.Event): cuda event for fn0
+        event1 (torch.cuda.Event): cuda event for fn1
+        aux_stream (Optional[torch.cuda.Stream]): the second cuda stream for fn1.
+            Multi-stream is disabled when aux_stream is None.
+
+    Returns:
+        tuple[Any, Any]: the return values of fn0() and fn1()
+    """
+
+    multi_stream = aux_stream is not None
+
+    if multi_stream:
+        event0.record()
+        result0 = fn0()
+
+        with torch.cuda.stream(aux_stream):
+            event0.wait()
+            result1 = fn1()
+            event1.record()
+        event1.wait()
+    else:
+        result0 = fn0()
+        result1 = fn1()
+    return (result0, result1)
+
+
+@triton.jit
+def _verify_cache_mask_kernel(
+    cache_topk_idx_ptr,
+    topk_idx_ptr,
+    hit_token_mask_ptr,
+    miss_token_mask_ptr,
+    stride_cache_m,
+    stride_cache_k,
+    stride_topk_m,
+    stride_topk_k,
+    stride_mask_m,
+    stride_mask_k,
+    K: int,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """
+    Compute hit and miss masks for cache verification.
+    
+    For each token i:
+    - hit_token_mask[i, :] checks if cache_topk_idx[i, :] elements are in topk_idx[i, :]
+    - miss_token_mask[i, :] checks if topk_idx[i, :] elements are NOT in cache_topk_idx[i, :]
+    """
+    pid_m = tl.program_id(0)
+    
+    # Load all values for this token
+    k_offsets = tl.arange(0, BLOCK_SIZE_K)
+    k_mask = k_offsets < K
+    
+    cache_vals = tl.load(
+        cache_topk_idx_ptr + pid_m * stride_cache_m + k_offsets * stride_cache_k,
+        mask=k_mask,
+        other=-2
+    )
+    topk_vals = tl.load(
+        topk_idx_ptr + pid_m * stride_topk_m + k_offsets * stride_topk_k,
+        mask=k_mask,
+        other=-3
+    )
+
+    intersect_mask = (cache_vals[:, None] == topk_vals[None, :])
+
+    hit_mask = tl.sum(intersect_mask, axis=1) > 0
+
+    miss_mask = tl.sum(intersect_mask, axis=0) == 0
+    
+    # Store results
+    tl.store(
+        hit_token_mask_ptr + pid_m * stride_mask_m + k_offsets * stride_mask_k,
+        hit_mask,
+        mask=k_mask
+    )
+    tl.store(
+        miss_token_mask_ptr + pid_m * stride_mask_m + k_offsets * stride_mask_k,
+        miss_mask,
+        mask=k_mask
+    )
+
+
+def verify_cache_mask_triton(
+    cache_topk_idx: torch.Tensor,
+    topk_idx: torch.Tensor,
+):
+    """
+    Triton kernel wrapper for cache verification mask computation.
+    
+    Args:
+        cache_topk_idx: [M, K] tensor of cached topk indices
+        topk_idx: [M, K] tensor of current topk indices
+        hit_token_mask: [M, K] output tensor for hit mask
+        miss_token_mask: [M, K] output tensor for miss mask
+    """
+    M, K = cache_topk_idx.shape
+
+    hit_token_mask = torch.zeros((M, K), dtype=torch.bool, device=cache_topk_idx.device)
+    miss_token_mask = torch.zeros((M, K), dtype=torch.bool, device=cache_topk_idx.device)
+    
+    # Determine block sizes
+    BLOCK_SIZE_K = triton.next_power_of_2(K)
+    
+    grid = (M,)
+    
+    _verify_cache_mask_kernel[grid](
+        cache_topk_idx,
+        topk_idx,
+        hit_token_mask,
+        miss_token_mask,
+        cache_topk_idx.stride(0),
+        cache_topk_idx.stride(1),
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        hit_token_mask.stride(0),
+        hit_token_mask.stride(1),
+        K,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+    )
+
+    return hit_token_mask, miss_token_mask
 
 
 class StreamTensorWrapper:
@@ -573,13 +716,8 @@ class USCTPMoECache(DecodeCache):
 
         if cache_topk_output is not None:
             cache_topk_idx = cache_topk_output.topk_ids
-            hit_token_mask = torch.zeros_like(topk_idx, dtype=torch.bool)
-            miss_token_mask = torch.zeros_like(topk_idx, dtype=torch.bool)
 
-            M = cache_topk_idx.shape[0]
-            for i in range(M):
-                hit_token_mask[i, :] = torch.isin(cache_topk_idx[i, :], topk_idx[i, :], assume_unique=True)
-                miss_token_mask[i, :] = torch.isin(topk_idx[i, :], cache_topk_idx[i, :], assume_unique=True, invert=True)
+            hit_token_mask, miss_token_mask = verify_cache_mask_triton(cache_topk_idx, topk_idx)
             
             # # calculate recall
             # tp = hit_token_mask.sum().item()  # an activated expert is predicted
@@ -596,7 +734,7 @@ class USCTPMoECache(DecodeCache):
         # ensure topk_idx is no longer used outside
         miss_topk_idx = topk_output.topk_ids
 
-        miss_topk_idx[~miss_mask] = -1
+        miss_topk_idx.masked_fill_(~miss_mask, -1)
 
         # hit mask is separated
         return StandardTopKOutput(
@@ -677,7 +815,7 @@ class USCTPMoECache(DecodeCache):
         routed_scaling_factor: float,
     ):
         # get hit results, no need to apply miss mask
-        hit_varlen_combine_output[~hit_mask, :] = 0
+        hit_varlen_combine_output.masked_fill_(~hit_mask.unsqueeze(2), 0)
 
         hit_results = fused_moe_post_sum(
             hit_varlen_combine_output,
