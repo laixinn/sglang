@@ -176,7 +176,7 @@ def _compute_moe_usc_prefill(layer):
         deep_gemm_num_sms=deep_gemm_num_sms,
         tbo_delta_stages=0,
         operations=[
-            layer.op_comm_prepare_attn,
+            layer.op_usc_comm_prepare_attn,
             layer.self_attn.op_prepare,
             layer.self_attn.op_core,
             layer.op_usc_comm_prepare_mlp,
@@ -194,7 +194,8 @@ def _compute_moe_usc_prefill(layer):
 
             layer.mlp.op_usc_estimate_a, # launch topk estimation, old results have been cleaned
             layer.mlp.op_usc_output,
-            layer.op_comm_postprocess_layer,
+
+            layer.op_usc_comm_postprocess_layer,
         ],
     )
 

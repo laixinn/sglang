@@ -18,9 +18,9 @@ if _ENABLE_PROFILE:
     import nvtx
 
 
-def execute_operations(inputs, operations):
+def execute_operations(inputs, operations, usc_mode: bool = False):
     stages = _convert_operations_to_stages(operations)
-    executor = _StageExecutor("primary", stages, inputs=inputs)
+    executor = _StageExecutor("primary", stages, inputs=inputs, usc_mode=usc_mode)
     for _ in range(executor.num_stages):
         executor.next()
     assert executor.done

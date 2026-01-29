@@ -698,3 +698,53 @@ def fused_moe(
         a2_scale=a2_scale,
         block_shape=block_shape,
     )
+
+def fused_moe_post_sum(
+    intermediate_cache3: torch.Tensor,
+    routed_scaling_factor: float,
+):
+    assert intermediate_cache3.ndim == 3
+
+    num_tokens, topk, hidden_size = intermediate_cache3.shape
+
+    out_hidden_states = torch.empty(
+            (num_tokens, hidden_size),
+            device=intermediate_cache3.device,
+            dtype=intermediate_cache3.dtype,
+        )
+
+    CHUNK_SIZE = 64 * 1024
+
+    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
+        begin_chunk_idx, end_chunk_idx = (
+            chunk * CHUNK_SIZE,
+            min((chunk + 1) * CHUNK_SIZE, num_tokens),
+        )
+
+        curr_intermediate_cache3 = intermediate_cache3[begin_chunk_idx:end_chunk_idx]
+        tokens_in_chunk = curr_intermediate_cache3.shape[0]
+
+        if topk == 1 and routed_scaling_factor == 1.0:
+            out_hidden_states[begin_chunk_idx:end_chunk_idx] = curr_intermediate_cache3
+        elif topk == 2 and routed_scaling_factor == 1.0:
+            torch.add(
+                curr_intermediate_cache3[:, 0],
+                curr_intermediate_cache3[:, 1],
+                out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+            ).squeeze(dim=1)
+        else:
+            # According to micro benchmark results, torch.compile can get better performance for small token.
+            if tokens_in_chunk <= 32:
+                moe_sum_reduce_torch_compile(
+                    curr_intermediate_cache3.view(*curr_intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    routed_scaling_factor,
+                )
+            else:
+                moe_sum_reduce(
+                    curr_intermediate_cache3.view(*curr_intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    routed_scaling_factor,
+                )
+
+        return out_hidden_states

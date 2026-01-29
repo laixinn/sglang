@@ -1070,7 +1070,6 @@ class DeepseekV2MoE(nn.Module):
 
     def op_usc_estimate_a(self, state):
         state.estimate_event = self.usc_cache.index_estimate_a(
-            state,
             self.usc_index_estimate,
             state.forward_batch.forward_mode,
             state.hidden_states_mlp_input,
@@ -1078,46 +1077,35 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def op_usc_estimate_b(self, state):
-        if (estimate_event := state.get("estimate_event")) is not None:
-            self.usc_cache.index_estimate_b(estimate_event)
-            state.pop("estimate_event")
+        if (estimate_event := state.pop("estimate_event")) is not None:
+            state.estimated_topk = self.usc_cache.index_estimate_b(estimate_event)
         else:
-            state.estimated_topk = self.topk.empty_topk_output(state.hidden_states_mlp_input.device)
-            state.estimated_router = None
+            state.estimated_topk = self.topk.full_topk_output(
+                state.hidden_states_mlp_input.device, state.hidden_states_mlp_input.shape[0], True)
 
     def op_usc_topk(self, state):
         if state.hidden_states_mlp_input.shape[0] > 0:
+            if (
+                not self._fuse_shared_experts_inside_sbo
+            ):  # TODO: check if it supports mtp
+                state.shared_output = self._forward_shared_experts(
+                    state.hidden_states_mlp_input, None
+                )
             # router_logits: (num_tokens, n_experts)
-            state.router_logits = self.gate(state.hidden_states_mlp_input)
-            state.topk_output = self.topk(state.hidden_states_mlp_input, state.router_logits)
+            router_logits = self.gate(state.hidden_states_mlp_input)
+            state.topk_output = self.topk(state.hidden_states_mlp_input, router_logits)
         else:
-            state.shared_output = None
-            state.topk_output = self.topk.empty_topk_output(state.hidden_states_mlp_input.device)
+            state.topk_output = self.topk.full_topk_output(
+                state.hidden_states_mlp_input.device, state.hidden_states_mlp_input.shape[0], True)
 
     def op_usc_verify(self, state):
         # For first layer, estimated_topk is all -1 and hit_mask is all False
-        estimated_topk = state.get("estimated_topk")
-        if estimated_topk is None:
-            # state.estimated_topk = self.topk.empty_topk_output(state.hidden_states_mlp_input.device)
-            # state.estimated_router = None
-
-            topk_ids = state.topk_output.topk_ids
-            estimated_topk_ids= torch.randint_like(topk_ids, low=topk_ids.min(), high=topk_ids.max()+1)
-
-            estimated_topk = StandardTopKOutput(
-                topk_weights=state.topk_output.topk_weights.clone(),
-                topk_ids=estimated_topk_ids,
-                router_logits=state.router_logits.clone(),
-            )
-
-            state.estimated_topk = estimated_topk
-            
         state.hit_mask, state.miss_mask = self.usc_cache._verify_cache(
-            state.topk_output, estimated_topk
+            state.topk_output, state.pop("estimated_topk")
         )
 
     def op_usc_hit_a(self, state):
-        state.wrapped_hit_varlen_combine_output = self.usc_cache.hit_forward_a(
+        state.hit_varlen_combine_output = self.usc_cache.hit_forward_a(
             experts=self.experts,
             hidden_states=state.hidden_states_mlp_input,
             estimated_topk=state.estimated_topk,
@@ -1125,21 +1113,25 @@ class DeepseekV2MoE(nn.Module):
 
     def op_usc_hit_b(self, state):
         state.hit_varlen_combine_output = \
-            self.usc_cache.hit_forward_b(state.pop("wrapped_hit_varlen_combine_output"))
+            self.usc_cache.hit_forward_b(state.pop("hit_varlen_combine_output"))
 
     def op_usc_miss(self, state):
-        self.usc_cache.miss_forward(
-            state=state,
-            experts=self.experts,
-            hidden_states=state.hidden_states_mlp_input,
-            estimated_topk=state.estimated_topk,
-            miss_mask=state.miss_mask,
-        )
+        state.miss_varlen_combine_output = \
+            self.usc_cache.miss_forward(
+                experts=self.experts,
+                hidden_states=state.hidden_states_mlp_input,
+                estimated_topk=state.pop("topk_output"),
+                miss_mask=state.miss_mask,
+            )
 
     def op_usc_reduce(self, state):
-        state.hidden_states_after_combine = self.usc_cache.reduce(state)
-        state.pop("estimated_topk")
-        state.pop("estimated_router")
+        state.hidden_states_after_combine = self.usc_cache.reduce(
+            state.pop("hit_varlen_combine_output"),
+            state.pop("miss_varlen_combine_output"),
+            state.pop("hit_mask"),
+            state.pop("miss_mask"),
+            self.routed_scaling_factor,
+        )
 
     def op_usc_output(self, state):
         final_hidden_states = state.pop("hidden_states_after_combine")
@@ -1155,6 +1147,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         state.hidden_states_mlp_output = final_hidden_states
+        state.pop("hidden_states_mlp_input")
 
     def usc_index_estimate(self, forward_mode, hidden_states, num_token_non_padded):
         if is_non_idle_and_non_empty(
@@ -1174,10 +1167,9 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
         else:
-            estimated_router = None
-            estimated_topk = self.topk.empty_topk_output(hidden_states.device)
+            estimated_topk = self.topk.full_topk_output(hidden_states.device, hidden_states.shape[0], True)
 
-        return estimated_router, estimated_topk
+        return estimated_topk
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -3029,6 +3021,58 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.forward_batch
         )
 
+    def op_usc_comm_prepare_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        tbo_subbatch_index: Optional[int] = None,
+        estimate_event: Optional[StandardTopKOutput] = None,
+    ):
+        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
+            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        )
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                zero_allocator=zero_allocator,
+                tbo_subbatch_index=tbo_subbatch_index,
+                estimate_event=estimate_event,
+            )
+        )
+
+    def op_usc_comm_postprocess_layer(self, state):
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            state.pop("hidden_states_mlp_output"),
+            state.pop("residual_after_comm_pre_mlp"),
+            state.forward_batch,
+        )
+
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            zero_allocator=state.zero_allocator,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+            estimate_event=state.estimate_event,
+        )
+
+        state.clear(
+            expect_keys={
+                "positions",
+                "forward_batch",
+                "zero_allocator",
+                "tbo_subbatch_index",
+                "estimate_event",
+            }
+        )
+        return output
+
 
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -3165,7 +3209,9 @@ class DeepseekV2Model(nn.Module):
             if self.layers[i].is_layer_sparse and i > 0:
                 object.__setattr__(self.layers[i-1].mlp, 'next_layer_gate', self.layers[i].mlp.gate)
                 object.__setattr__(self.layers[i-1].mlp, 'next_layer_topk', self.layers[i].mlp.topk)
-                object.__setattr__(self.layers[i].mlp, 'has_usc_estimation', True)
+                object.__setattr__(self.layers[i-1].mlp, 'has_usc_estimation', True)
+                if i == self.end_layer - 1:
+                    object.__setattr__(self.layers[i].mlp, 'has_usc_estimation', False)
             else:
                 object.__setattr__(self.layers[i].mlp, 'next_layer_gate', None)
                 object.__setattr__(self.layers[i].mlp, 'next_layer_topk', None)

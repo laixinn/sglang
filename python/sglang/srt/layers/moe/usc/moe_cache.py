@@ -15,6 +15,7 @@ from sglang.srt.layers.moe.usc.decode_cache import DecodeCache
 
 from sglang.srt.batch_overlap.operations import _StateDict
 from sglang.srt.layers.moe.topk import VarlenTopKOutput, StandardTopKOutput
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe_post_sum
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import (
@@ -552,11 +553,9 @@ class USCTPMoECache(DecodeCache):
     def __init__(self, experts: FusedMoE):
         super().__init__()
 
-        # hit moe runner
+        # hit moe runner, miss moe can support topk = -1 filtering
         self.hit_moe_runner_config = replace(experts.moe_runner_config, no_combine=True, inplace=False)
         self.experts = experts
-
-        # miss moe runner
 
         self.alt_stream = torch.cuda.Stream()
 
@@ -582,54 +581,22 @@ class USCTPMoECache(DecodeCache):
                 hit_token_mask[i, :] = torch.isin(cache_topk_idx[i, :], topk_idx[i, :], assume_unique=True)
                 miss_token_mask[i, :] = torch.isin(topk_idx[i, :], cache_topk_idx[i, :], assume_unique=True, invert=True)
             
-            # calculate recall
-            tp = hit_token_mask.sum().item()  # an activated expert is predicted
-            fn = miss_token_mask.sum().item() # anactivated expert is not predicted
-            self._last_tp = tp
-            self._last_fn = fn
+            # # calculate recall
+            # tp = hit_token_mask.sum().item()  # an activated expert is predicted
+            # fn = miss_token_mask.sum().item() # anactivated expert is not predicted
+            # self._last_tp = tp
+            # self._last_fn = fn
         else:
             hit_token_mask = torch.zeros_like(topk_idx, dtype=torch.bool)
             miss_token_mask = torch.ones_like(topk_idx, dtype=torch.bool)
 
         return hit_token_mask, miss_token_mask
 
-    def _get_hit_cache(self, cache_topk_output: TopKOutput, hit_mask: torch.Tensor):
-        topk_idx = cache_topk_output.topk_ids
-
-        hit_token_mask = hit_mask
-
-        M = topk_idx.shape[0]
-        hit_topk_m = hit_token_mask.sum(dim=1)
-
-        hit_topk_idx = torch.full_like(topk_idx, -1)
-        for i in range(M):
-            if hit_topk_m[i] > 0:
-                hit_topk_idx[i, :hit_topk_m[i]] = topk_idx[i, hit_token_mask[i]]
-
-        return VarlenTopKOutput(
-            topk_weights=cache_topk_output.topk_weights,
-            topk_ids=hit_topk_idx,
-            router_logits=cache_topk_output.router_logits,
-            topk_m=hit_topk_m,
-        )
-
     def _get_miss_cache(self, topk_output: TopKOutput, miss_mask: torch.Tensor):
-        topk_idx = topk_output.topk_ids
+        # ensure topk_idx is no longer used outside
+        miss_topk_idx = topk_output.topk_ids
 
-        miss_token_mask = miss_mask
-        miss_topk_m = miss_token_mask.sum(dim=1)
-
-        miss_topk_idx = torch.full_like(topk_idx, -1)
-        for i in range(topk_idx.shape[0]):
-            if miss_topk_m[i] > 0:
-                miss_topk_idx[i, :miss_topk_m[i]] = topk_idx[i, miss_token_mask[i]]
-
-        # return VarlenTopKOutput(
-        #         topk_weights=topk_output.topk_weights,
-        #         topk_ids=miss_topk_idx,
-        #         router_logits=topk_output.router_logits,
-        #         topk_m=miss_topk_m,
-        #     )
+        miss_topk_idx[~miss_mask] = -1
 
         # hit mask is separated
         return StandardTopKOutput(
@@ -640,21 +607,23 @@ class USCTPMoECache(DecodeCache):
     
     def index_estimate_a(
         self, 
-        state: _StateDict,
         index_estimate_fn: Callable,
         forward_mode: ForwardMode,
         hidden_states: torch.Tensor,
         num_token_non_padded: torch.Tensor,
     ):
-        estimate_event = torch.cuda.Event()
-        with torch.cuda.stream(self.alt_stream):
-            state.estimated_router, state.estimated_topk = \
-                index_estimate_fn(forward_mode, hidden_states, num_token_non_padded)
-            estimate_event.record()
-        return estimate_event
+        # estimate_event = torch.cuda.Event()
+        # with torch.cuda.stream(self.alt_stream):
+        estimated_topk = \
+            index_estimate_fn(forward_mode, hidden_states, num_token_non_padded)
+        #     estimate_event.record()
+        # return estimate_event
+        return estimated_topk
 
-    def index_estimate_b(self, estimate_event: torch.cuda.Event):
-        torch.cuda.current_stream().wait_event(estimate_event)
+    # def index_estimate_b(self, estimate_event: torch.cuda.Event):
+    #     torch.cuda.current_stream().wait_event(estimate_event)
+    def index_estimate_b(self, estimated_topk: TopKOutput):
+        return estimated_topk
 
     def hit_forward_a(
         self,
@@ -662,22 +631,25 @@ class USCTPMoECache(DecodeCache):
         hidden_states: torch.Tensor,
         estimated_topk: TopKOutput,
     ):
-        self.alt_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.alt_stream):
-            with override_moe_config(experts.quant_method.runner, self.hit_moe_runner_config):
-                hit_varlen_combine_output = experts(
-                    hidden_states=hidden_states,
-                    topk_output=estimated_topk,
-                )
-                hit_event = self.alt_stream.record_event()
-        return StreamTensorWrapper(hit_varlen_combine_output, hit_event)
+        # self.alt_stream.wait_stream(torch.cuda.current_stream())
+        # with torch.cuda.stream(self.alt_stream):
+        with override_moe_config(experts.quant_method.runner, self.hit_moe_runner_config):
+            hit_varlen_combine_output = experts(
+                hidden_states=hidden_states,
+                topk_output=estimated_topk,
+            )
+            # hit_event = self.alt_stream.record_event()
+        # return StreamTensorWrapper(hit_varlen_combine_output, hit_event)
+        return hit_varlen_combine_output
 
-    def hit_forward_b(self, wrapped_tensor: StreamTensorWrapper):
-        return wrapped_tensor.get_tensor()
+    # def hit_forward_b(self, wrapped_tensor: StreamTensorWrapper):
+    #     return wrapped_tensor.get_tensor()
+
+    def hit_forward_b(self, hit_varlen_combine_output: torch.Tensor):
+        return hit_varlen_combine_output
 
     def miss_forward(
         self, 
-        state: _StateDict,
         experts: FusedMoE,
         hidden_states: torch.Tensor,
         estimated_topk: TopKOutput,
@@ -689,18 +661,28 @@ class USCTPMoECache(DecodeCache):
 
         # support varlen topk moe
         # standard combine output with topk=-1 positions excluded from combine
-        state.miss_varlen_combine_output = experts(
+        miss_varlen_combine_output = experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
 
-    def reduce(self, state: _StateDict):
-        # TODO: get hit ones, miss ones, then reduce
-        hit_combine = state.hit_varlen_combine_output
-        miss_combine = state.miss_varlen_combine_output
+        return miss_varlen_combine_output
 
-        # TODO: get hit and miss ones
+    def reduce(
+        self,
+        hit_varlen_combine_output: torch.Tensor,
+        miss_varlen_combine_output: torch.Tensor,
+        hit_mask: torch.Tensor,
+        miss_mask: torch.Tensor,
+        routed_scaling_factor: float,
+    ):
+        # get hit results, no need to apply miss mask
+        hit_varlen_combine_output[~hit_mask, :] = 0
 
+        hit_results = fused_moe_post_sum(
+            hit_varlen_combine_output,
+            routed_scaling_factor,
+        )
 
         # reduce
-        return hit_results + miss_results
+        return hit_results + miss_varlen_combine_output

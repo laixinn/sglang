@@ -825,11 +825,11 @@ def model_forward_maybe_tbo(
     )
     layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
     operations_strategy = OperationsStrategy.init_new_tbo(
-        layers, forward_batch.global_forward_mode
+        layers, forward_batch.forward_mode
     )
     if enable_tbo:
         if is_usc_enabled():
-            return _model_forward_non_tbo(inputs, operations_strategy)
+            return _model_forward_non_tbo(inputs, operations_strategy, usc_mode=True)
         else:
             return _model_forward_tbo(
                 inputs=inputs,
@@ -873,8 +873,8 @@ def _model_forward_tbo(
     return _model_forward_tbo_merge_outputs(*outputs_arr, original_hidden_states_len)
 
 
-def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
-    outputs = execute_operations(inputs, operations_strategy.operations)
+def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy, usc_mode: bool = False):
+    outputs = execute_operations(inputs, operations_strategy.operations, usc_mode=usc_mode)
     return outputs["hidden_states"], outputs["residual"]
 
 

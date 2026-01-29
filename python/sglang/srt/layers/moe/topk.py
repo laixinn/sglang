@@ -371,6 +371,21 @@ class TopK(MultiPlatformOp):
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
+    def full_topk_output(self, device: torch.device, num_tokens: int, fused_shared_experts: bool = False) -> TopKOutput:
+        topk = self.topk_config.top_k
+
+        if not fused_shared_experts:
+            topk -= self.topk_config.num_fused_shared_experts
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            topk_weights = torch.full((num_tokens, topk), 0, dtype=torch.float32, device=device)
+            topk_ids = torch.full((num_tokens, topk), -1, dtype=torch.int32, device=device)
+        router_logits = torch.full((num_tokens, topk), 0, dtype=torch.float32, device=device)
+
+        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
 
 # ------------------------------- TopK implementation -------------------------------------
 
