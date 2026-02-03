@@ -1,0 +1,164 @@
+/* Copyright 2025 SGLang Team. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+
+#include <THC/THCAtomics.cuh>
+
+#include "utils.h"
+
+#define VEC_SIZE 4
+using Vec = int4;
+
+// Debug flag - set to 1 to enable debug prints
+#define DEBUG_KERNEL 1
+
+template <typename scalar_t, typename bool_t>
+__global__ void moe_usc_hit_replace_kernel(
+    scalar_t* grounded_weights,
+    bool_t* miss_mask,
+    scalar_t* hit_weights,
+    bool_t* hit_mask,
+    int32_t num_tokens,
+    int32_t topk) {
+  int tid = threadIdx.x;
+  int stride = blockDim.x / 2 * topk;
+  int row_id = tid / 2;
+  int role = tid % 2;
+
+  int lane_id = tid % WARP_SIZE;
+  int lane_offset = lane_id & ~1;
+  unsigned mask_sync = 0x3 << lane_offset;
+
+  if (row_id >= num_tokens) return;
+
+#pragma unroll
+  for (int base = 0; base < num_tokens * topk; base += stride){
+    int offset = base + row_id * topk;
+    int producer_idx = 0;
+    int consumer_idx = 0;
+
+    while (producer_idx < topk && consumer_idx < topk) {
+      bool will_send = false;
+      bool will_recv = false;
+      scalar_t value_to_send = 0;
+
+      if (role == 0) {
+        // Producer
+        while (producer_idx < topk && !will_send) {
+          bool_t flag = miss_mask[offset + producer_idx];
+
+          if (!flag) {
+            will_send = true;
+            value_to_send = grounded_weights[offset + producer_idx];
+          }
+          producer_idx++;
+        }
+      }else{
+        // Consumer
+        while (consumer_idx < topk && !will_recv) {
+          bool_t flag = hit_mask[offset + consumer_idx];
+          if (flag) {
+            will_recv = true;
+          } else {
+            consumer_idx++;
+          }
+        }
+      }
+
+      __syncwarp(mask_sync);
+
+      // TODO: maybe simplify this code by one __shfl_xor_sync call?
+      unsigned send_mask = __ballot_sync(mask_sync, will_send);
+      unsigned recv_mask = __ballot_sync(mask_sync, will_recv);
+      bool pair_send = (send_mask >> lane_offset) & 1;
+      bool pair_recv = (recv_mask >> (lane_offset + 1)) & 1;
+
+#if DEBUG_KERNEL
+      if (tid <= 1) {
+        printf("DEBUGGING: tid=%d producer_idx=%d consumer_idx=%d will_send=%d will_recv=%d send_mask=%d recv_mask=%d lane_offset=%d pair_send=%d pair_recv=%d\n", tid, producer_idx, consumer_idx, will_send, will_recv, send_mask, recv_mask, lane_offset, pair_send, pair_recv);
+      }
+#endif
+
+      if (pair_send && pair_recv) {
+        scalar_t recevied_value = 
+            static_cast<scalar_t>(__shfl_xor_sync(mask_sync, static_cast<float>(value_to_send), 1));
+
+        if (role == 1 && will_recv) {
+          hit_weights[offset + consumer_idx] = recevied_value;
+          consumer_idx++;
+        }
+      } else {
+        // If one side finished, break to avoid hanging
+        break;
+      }
+    }
+
+    __syncwarp(mask_sync);
+  }
+}
+
+
+void moe_usc_hit_replace(
+  torch::Tensor grounded_weights,
+  torch::Tensor miss_mask,
+  torch::Tensor hit_weights,
+  torch::Tensor hit_mask) {
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  int threads = 1024;
+  threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+
+  int32_t num_tokens = grounded_weights.size(0);
+  int32_t topk = grounded_weights.size(1);
+
+  TORCH_CHECK(grounded_weights.dim() == 2, "grounded_weights must be 2D [num_tokens, topk]");
+  TORCH_CHECK(grounded_weights.size(0) == num_tokens && grounded_weights.size(1) == topk,
+              "grounded_weights must have shape [num_tokens, topk]");
+
+  int threads_per_block = 2 * 512;
+
+  DISPATCH_FLOAT_TYPES(grounded_weights.scalar_type(), "moe_usc_hit_replace_kernel", [&] {
+    using bool_t = bool;
+    const int32_t threads = max((int32_t)threads_per_block, WARP_SIZE);
+    const int32_t shared_mem_size = 0; //(threads * topk) * sizeof(int32_t);
+
+    auto replace_kernel = moe_usc_hit_replace_kernel<scalar_t, bool_t>;
+    replace_kernel<<<1, threads, shared_mem_size, stream>>>(
+        grounded_weights.data_ptr<scalar_t>(),
+        (bool_t*)miss_mask.data_ptr(),
+        hit_weights.data_ptr<scalar_t>(),
+        (bool_t*)hit_mask.data_ptr(),
+        num_tokens,
+        topk
+    );
+    
+    // Add error checking
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      printf("Kernel launch error: %s\n", cudaGetErrorString(err));
+    }
+    
+    // This will hang if kernel hangs
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+      printf("Kernel execution error: %s\n", cudaGetErrorString(err));
+    }
+    
+    return true;
+  });
+}

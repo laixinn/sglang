@@ -91,8 +91,10 @@ def _verify_cache_mask_kernel(
     stride_cache_k,
     stride_topk_m,
     stride_topk_k,
-    stride_mask_m,
-    stride_mask_k,
+    stride_hit_mask_m,
+    stride_hit_mask_k,
+    stride_miss_mask_m,
+    stride_miss_mask_k,
     K: int,
     BLOCK_SIZE_K: tl.constexpr,
 ):
@@ -122,18 +124,18 @@ def _verify_cache_mask_kernel(
 
     intersect_mask = (cache_vals[:, None] == topk_vals[None, :])
 
-    hit_mask = tl.sum(intersect_mask, axis=1) > 0
+    hit_mask = tl.sum(intersect_mask, axis=0) > 0
 
-    miss_mask = tl.sum(intersect_mask, axis=0) == 0
+    miss_mask = tl.sum(intersect_mask, axis=1) == 0
     
     # Store results
     tl.store(
-        hit_token_mask_ptr + pid_m * stride_mask_m + k_offsets * stride_mask_k,
+        hit_token_mask_ptr + pid_m * stride_hit_mask_m + k_offsets * stride_hit_mask_k,
         hit_mask,
         mask=k_mask
     )
     tl.store(
-        miss_token_mask_ptr + pid_m * stride_mask_m + k_offsets * stride_mask_k,
+        miss_token_mask_ptr + pid_m * stride_miss_mask_m + k_offsets * stride_miss_mask_k,
         miss_mask,
         mask=k_mask
     )
@@ -173,6 +175,8 @@ def verify_cache_mask_triton(
         topk_idx.stride(1),
         hit_token_mask.stride(0),
         hit_token_mask.stride(1),
+        miss_token_mask.stride(0),
+        miss_token_mask.stride(1),
         K,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
@@ -697,7 +701,12 @@ class USCTPMoECache(DecodeCache):
         super().__init__()
 
         # hit moe runner, miss moe can support topk = -1 filtering
-        self.hit_moe_runner_config = replace(experts.moe_runner_config, no_combine=True, inplace=False)
+        self.hit_moe_runner_config = replace(
+            experts.moe_runner_config, 
+            no_combine=True, 
+            inplace=False, 
+            # usc_hit_forward=True
+        )
         self.experts = experts
 
         self.alt_stream = torch.cuda.Stream()
@@ -733,13 +742,32 @@ class USCTPMoECache(DecodeCache):
     def _get_miss_cache(self, topk_output: TopKOutput, miss_mask: torch.Tensor):
         # ensure topk_idx is no longer used outside
         miss_topk_idx = topk_output.topk_ids
+        # miss_topk_weights = topk_output.topk_weights
+        # miss_router_logits = topk_output.router_logits
 
         miss_topk_idx.masked_fill_(~miss_mask, -1)
+        # miss_topk_weights.masked_fill_(~miss_mask, 0.0)
+        # miss_router_logits.masked_fill_(~miss_mask, 0.0)
 
         # hit mask is separated
         return StandardTopKOutput(
             topk_weights=topk_output.topk_weights,
             topk_ids=miss_topk_idx,
+            router_logits=topk_output.router_logits,
+        )
+
+    def _get_hit_cache(self, topk_output: TopKOutput, hit_mask: torch.Tensor):
+        hit_topk_idx = topk_output.topk_ids
+        hit_topk_weights = topk_output.topk_weights
+        # hit_router_logits = topk_output.router_logits
+
+        hit_topk_idx.masked_fill_(~hit_mask, -1)
+        hit_topk_weights.masked_fill_(~hit_mask, 0.0)
+        # hit_router_logits.masked_fill_(~hit_mask, 0.0)
+
+        return StandardTopKOutput(
+            topk_weights=hit_topk_weights,
+            topk_ids=hit_topk_idx,
             router_logits=topk_output.router_logits,
         )
     
@@ -790,11 +818,11 @@ class USCTPMoECache(DecodeCache):
         self, 
         experts: FusedMoE,
         hidden_states: torch.Tensor,
-        estimated_topk: TopKOutput,
+        grounded_topk: TopKOutput,
         miss_mask: torch.Tensor,
     ):
         topk_output = self._get_miss_cache(
-            estimated_topk, miss_mask
+            grounded_topk, miss_mask
         )
 
         # support varlen topk moe

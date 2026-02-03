@@ -223,6 +223,10 @@ __device__ void moe_fused_gate_impl(
     __syncthreads();
   }
 
+  if (output_sum == 0.0f) {
+    output_sum = 1e-6;
+  }
+
   if (thread_group_idx == 0 && num_fused_shared_experts > 0) {
     int64_t last_idx = topk * thread_row + topk_excluding_share_expert_fusion;
     int64_t expert_offset = 0;
