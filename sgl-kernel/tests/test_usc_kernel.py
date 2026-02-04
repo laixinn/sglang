@@ -7,9 +7,37 @@ from math import e
 import torch
 import pytest
 import triton
+import numpy as np
 
 from sglang.srt.layers.moe.usc.moe_cache import verify_cache_mask_triton
 from sgl_kernel import moe_usc_hit_replace
+
+def bench(fn, num_warmups: int = 10, num_tests: int = 50, post_fn=None):
+    # Flush L2 cache with 256 MB data
+    torch.cuda.synchronize()
+    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
+
+    # Warmup
+    for _ in range(num_warmups):
+        fn()
+
+    # Flush L2
+    cache.zero_()
+
+    # Testing
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    for i in range(num_tests):
+        # Record
+        start_events[i].record()
+        fn()
+        end_events[i].record()
+        if post_fn is not None:
+            post_fn()
+    torch.cuda.synchronize()
+
+    times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])[1:]
+    return np.average(times), np.min(times), np.max(times)
 
 def usc_hit_replace_native(
     grounded_weights,
@@ -17,9 +45,9 @@ def usc_hit_replace_native(
     hit_weights,
     hit_mask,
 ):
-    hit_weights = hit_weights.clone()
-    hit_weights[hit_mask] = grounded_weights[~miss_mask]
-    return hit_weights
+    new_hit_weights = hit_weights.clone()
+    new_hit_weights[hit_mask] = grounded_weights[~miss_mask]
+    return new_hit_weights
 
 def generate_test_data(num_tokens, topk, num_experts, dtype, device):
     grounded_weights = torch.randn(num_tokens, topk, device=device, dtype=dtype)
@@ -42,15 +70,16 @@ def test_usc_hit_replace():
                 grounded_weights, estimated_weights, grounded_idx, estimated_idx, hit_mask, miss_mask = \
                     generate_test_data(num_tokens=num_tokens, topk=topk, num_experts=num_experts, dtype=torch.bfloat16, device='cuda')
 
-                output_ref = torch.zeros_like(estimated_weights)
-                native_lambda = lambda: usc_hit_replace_native(grounded_weights, miss_mask, output_ref, hit_mask)
+                native_lambda = lambda: usc_hit_replace_native(grounded_weights, miss_mask, estimated_weights, hit_mask)
 
-                output_cuda = torch.zeros_like(estimated_weights)
-                cuda_lambda = lambda: moe_usc_hit_replace(grounded_weights, miss_mask, output_cuda, hit_mask)
+                cuda_lambda = lambda: moe_usc_hit_replace(grounded_weights, miss_mask, estimated_weights, hit_mask)
 
                 # check accuracy
                 output_ref = native_lambda()
+                output_ref_clone = output_ref.clone()
+                torch.cuda.synchronize()
                 output_cuda = cuda_lambda()
+                torch.testing.assert_close(output_ref, output_ref_clone, rtol=1e-5, atol=1e-5)
                 torch.testing.assert_close(output_cuda, output_ref, rtol=1e-5, atol=1e-5)
                 print(f"✓ Basic test passed for num_tokens={num_tokens}, topk={topk}, num_experts={num_experts}")
 

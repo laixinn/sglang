@@ -25,16 +25,16 @@ limitations under the License.
 using Vec = int4;
 
 // Debug flag - set to 1 to enable debug prints
-#define DEBUG_KERNEL 1
+#define DEBUG_KERNEL 0
 
 template <typename scalar_t, typename bool_t>
 __global__ void moe_usc_hit_replace_kernel(
-    scalar_t* grounded_weights,
-    bool_t* miss_mask,
-    scalar_t* hit_weights,
-    bool_t* hit_mask,
-    int32_t num_tokens,
-    int32_t topk) {
+    const scalar_t* __restrict__ grounded_weights,
+    const bool_t* __restrict__ miss_mask,
+    scalar_t* __restrict__ hit_weights,
+    const bool_t* __restrict__ hit_mask,
+    const int32_t num_tokens,
+    const int32_t topk) {
   int tid = threadIdx.x;
   int stride = blockDim.x / 2 * topk;
   int row_id = tid / 2;
@@ -44,6 +44,13 @@ __global__ void moe_usc_hit_replace_kernel(
   int lane_offset = lane_id & ~1;
   unsigned mask_sync = 0x3 << lane_offset;
 
+#if DEBUG_KERNEL
+  if (tid > 1 && tid <= 3) {
+    printf("DEBUGGING: tid=%d lane_id=%d lane_offset=%d mask_sync=%u\n", tid, lane_id, lane_offset, mask_sync);
+  }
+#endif
+
+  // avoid accessing out of bounds
   if (row_id >= num_tokens) return;
 
 #pragma unroll
@@ -52,7 +59,7 @@ __global__ void moe_usc_hit_replace_kernel(
     int producer_idx = 0;
     int consumer_idx = 0;
 
-    while (producer_idx < topk && consumer_idx < topk) {
+    while (producer_idx < topk || consumer_idx < topk) {
       bool will_send = false;
       bool will_recv = false;
       scalar_t value_to_send = 0;
@@ -61,11 +68,16 @@ __global__ void moe_usc_hit_replace_kernel(
         // Producer
         while (producer_idx < topk && !will_send) {
           bool_t flag = miss_mask[offset + producer_idx];
-
+#if DEBUG_KERNEL
+          if (tid > 1 && tid <= 3) {
+            printf("DEBUGGING: miss_mask[%d + %d] = %d\n", offset, producer_idx, flag);
+          }
+#endif
           if (!flag) {
             will_send = true;
             value_to_send = grounded_weights[offset + producer_idx];
           }
+          
           producer_idx++;
         }
       }else{
@@ -80,28 +92,28 @@ __global__ void moe_usc_hit_replace_kernel(
         }
       }
 
-      __syncwarp(mask_sync);
-
-      // TODO: maybe simplify this code by one __shfl_xor_sync call?
-      unsigned send_mask = __ballot_sync(mask_sync, will_send);
-      unsigned recv_mask = __ballot_sync(mask_sync, will_recv);
-      bool pair_send = (send_mask >> lane_offset) & 1;
-      bool pair_recv = (recv_mask >> (lane_offset + 1)) & 1;
+      // Check if both sides of the pair are ready using single shuffle
+      bool my_ready = (role == 0) ? will_send : will_recv;
+      bool partner_ready = __shfl_xor_sync(mask_sync, my_ready, 1);
+      bool can_exchange = my_ready && partner_ready;
 
 #if DEBUG_KERNEL
-      if (tid <= 1) {
-        printf("DEBUGGING: tid=%d producer_idx=%d consumer_idx=%d will_send=%d will_recv=%d send_mask=%d recv_mask=%d lane_offset=%d pair_send=%d pair_recv=%d\n", tid, producer_idx, consumer_idx, will_send, will_recv, send_mask, recv_mask, lane_offset, pair_send, pair_recv);
+      if (tid > 1 && tid <= 3){
+        printf("DEBUGGING: tid=%d producer_idx=%d consumer_idx=%d will_send=%d will_recv=%d my_ready=%d partner_ready=%d can_exchange=%d\n", 
+          tid, producer_idx, consumer_idx, will_send, will_recv, my_ready, partner_ready, can_exchange);
       }
 #endif
 
-      if (pair_send && pair_recv) {
-        scalar_t recevied_value = 
-            static_cast<scalar_t>(__shfl_xor_sync(mask_sync, static_cast<float>(value_to_send), 1));
+      if (can_exchange) {
+        __half value_as_half = *reinterpret_cast<__half*>(&value_to_send);
+        __half received = __shfl_xor_sync(mask_sync, value_as_half, 1);
+        scalar_t recevied_value = *reinterpret_cast<scalar_t*>(&received);
 
         if (role == 1 && will_recv) {
           hit_weights[offset + consumer_idx] = recevied_value;
           consumer_idx++;
         }
+
       } else {
         // If one side finished, break to avoid hanging
         break;
@@ -116,21 +128,20 @@ __global__ void moe_usc_hit_replace_kernel(
 void moe_usc_hit_replace(
   torch::Tensor grounded_weights,
   torch::Tensor miss_mask,
-  torch::Tensor hit_weights,
+  torch::Tensor& hit_weights,
   torch::Tensor hit_mask) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-  int threads = 1024;
-  threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
   int32_t num_tokens = grounded_weights.size(0);
   int32_t topk = grounded_weights.size(1);
 
-  TORCH_CHECK(grounded_weights.dim() == 2, "grounded_weights must be 2D [num_tokens, topk]");
-  TORCH_CHECK(grounded_weights.size(0) == num_tokens && grounded_weights.size(1) == topk,
-              "grounded_weights must have shape [num_tokens, topk]");
+  TORCH_CHECK(hit_weights.dim() == 2, "hit_weights must be 2D [num_tokens, topk]");
+  TORCH_CHECK(hit_weights.size(0) == num_tokens && hit_weights.size(1) == topk,
+              "hit_weights must have shape [num_tokens, topk]");
+  TORCH_CHECK(grounded_weights.scalar_type() == hit_weights.scalar_type(), "grounded_weights and hit_weights must have the same scalar type");
 
   int threads_per_block = 2 * 512;
+  threads_per_block = ((threads_per_block + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
   DISPATCH_FLOAT_TYPES(grounded_weights.scalar_type(), "moe_usc_hit_replace_kernel", [&] {
     using bool_t = bool;
