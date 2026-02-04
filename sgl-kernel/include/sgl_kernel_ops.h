@@ -309,6 +309,12 @@ void moe_align_block_size(
     torch::Tensor cumsum_buffer,
     bool pad_sorted_token_ids);
 
+void moe_usc_hit_replace(
+    torch::Tensor grounded_weights,
+    torch::Tensor miss_mask,
+    torch::Tensor& hit_weights,
+    torch::Tensor hit_mask);
+
 void topk_softmax(
     torch::Tensor& topk_weights,
     torch::Tensor& topk_indices,

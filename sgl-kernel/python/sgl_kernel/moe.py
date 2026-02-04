@@ -25,6 +25,47 @@ def moe_align_block_size(
     )
 
 
+def moe_usc_hit_replace(
+    grounded_weights: torch.Tensor,
+    miss_mask: torch.Tensor,
+    hit_weights: torch.Tensor,
+    hit_mask: torch.Tensor,
+    inplace: bool = False,
+) -> torch.Tensor:
+    """
+    USC (Unified Speculative Cache) hit replacement operation.
+    
+    Replaces hit_weights with grounded_weights where masks match:
+        hit_topk_weights[hit_mask] = grounded_topk.topk_weights[~miss_mask]
+    
+    This is a producer-consumer kernel where:
+    - Producer: reads from grounded_weights where ~miss_mask
+    - Consumer: writes to hit_weights where hit_mask
+    
+    Args:
+        grounded_weights: Source weights [num_tokens, topk]
+        miss_mask: Boolean mask indicating miss tokens [num_tokens]
+        hit_weights: Output weights [num_tokens, topk] (modified in-place)
+        hit_mask: Boolean mask indicating hit tokens [num_tokens]
+    
+    Note:
+        - Uses 2 threads per row (producer + consumer)
+        - Supports float32 and float16
+        - CUDA graph compatible
+    """
+    if inplace:
+        new_hit_weights = hit_weights
+    else:
+        new_hit_weights = hit_weights.clone()
+    torch.ops.sgl_kernel.moe_usc_hit_replace.default(
+        grounded_weights,
+        miss_mask,
+        new_hit_weights,
+        hit_mask,
+    )
+    return new_hit_weights
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,

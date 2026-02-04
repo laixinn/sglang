@@ -182,11 +182,12 @@ def _compute_moe_usc_prefill(layer):
             layer.op_usc_comm_prepare_mlp,
             
             layer.mlp.op_usc_estimate_b, # estimated topk is ready
-            layer.mlp.op_usc_hit_a,  # overlap hit forward with op_gate+op_select_experts
 
             layer.mlp.op_usc_topk,
             
             layer.mlp.op_usc_verify, # sync: use true and estimated topk
+
+            layer.mlp.op_usc_hit_a,  # overlap hit forward with op_gate+op_select_experts
 
             layer.mlp.op_usc_miss,   # get partial true topk results and shared experts
             layer.mlp.op_usc_hit_b,  # get full estimated topk results

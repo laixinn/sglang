@@ -174,7 +174,7 @@ from sglang.srt.utils import (
 
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.usc.moe_cache import (
-    USCTPMoECache
+    USCTPMoECache, 
 )
 from sglang.srt.layers.moe.utils import is_usc_enabled
 
@@ -208,6 +208,7 @@ if _is_cuda:
         dsv3_fused_a_gemm,
         dsv3_router_gemm,
         merge_state_v2,
+        moe_usc_hit_replace,
     )
 elif _is_cpu and _is_cpu_amx_available:
     pass
@@ -1101,14 +1102,42 @@ class DeepseekV2MoE(nn.Module):
     def op_usc_verify(self, state):
         # For first layer, estimated_topk is all -1 and hit_mask is all False
         state.hit_mask, state.miss_mask = self.usc_cache._verify_cache(
-            state.topk_output, state.pop("estimated_topk")
+            state.topk_output, state.estimated_topk
         )
 
     def op_usc_hit_a(self, state):
+        # state.estimated_topk = self.usc_cache._get_hit_cache(
+        #     state.pop("estimated_topk"), 
+        #     state.hit_mask,
+        # )
+
+        estimated_topk = state.pop("estimated_topk")
+        grounded_topk = state.topk_output
+        hit_mask = state.hit_mask
+        miss_mask = state.miss_mask
+        hit_topk_idx = estimated_topk.topk_ids
+        hit_topk_weights = estimated_topk.topk_weights
+
+        hit_topk_idx.masked_fill_(~hit_mask, -1)
+        # TODO: this kernel temporarily considers small topk, optimize this
+        # hit_topk_weights[hit_mask] = grounded_topk.topk_weights[~miss_mask]
+        # hit_topk_weights = moe_usc_hit_replace(grounded_topk.topk_weights, miss_mask, hit_topk_weights, hit_mask)
+        hit_topk_weights.masked_fill_(~hit_mask, 0.0)
+
+        hit_topk_output = StandardTopKOutput(
+            topk_weights=hit_topk_weights,
+            topk_ids=hit_topk_idx,
+            router_logits=grounded_topk.router_logits,
+        )
+
+        state.estimated_topk = hit_topk_output
+
+        # state.estimated_topk = state.topk_output
+
         state.hit_varlen_combine_output = self.usc_cache.hit_forward_a(
             experts=self.experts,
             hidden_states=state.hidden_states_mlp_input,
-            estimated_topk=state.estimated_topk,
+            estimated_topk=state.pop("estimated_topk"),
         )
 
     def op_usc_hit_b(self, state):
@@ -1120,11 +1149,12 @@ class DeepseekV2MoE(nn.Module):
             self.usc_cache.miss_forward(
                 experts=self.experts,
                 hidden_states=state.hidden_states_mlp_input,
-                estimated_topk=state.pop("topk_output"),
+                grounded_topk=state.pop("topk_output"),
                 miss_mask=state.miss_mask,
             )
 
     def op_usc_reduce(self, state):
+        
         state.hidden_states_after_combine = self.usc_cache.reduce(
             state.pop("hit_varlen_combine_output"),
             state.pop("miss_varlen_combine_output"),
@@ -1144,11 +1174,9 @@ class DeepseekV2MoE(nn.Module):
             and not state.pop("should_allreduce_fusion")
             and not state.pop("use_reduce_scatter")
         ):
-            reduced_final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        else:
-            reduced_final_hidden_states = final_hidden_states
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        state.hidden_states_mlp_output = reduced_final_hidden_states
+        state.hidden_states_mlp_output = final_hidden_states
         state.pop("hidden_states_mlp_input")
 
     def usc_index_estimate(self, forward_mode, hidden_states, num_token_non_padded):

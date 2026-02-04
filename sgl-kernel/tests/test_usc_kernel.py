@@ -12,33 +12,6 @@ import numpy as np
 from sglang.srt.layers.moe.usc.moe_cache import verify_cache_mask_triton
 from sgl_kernel import moe_usc_hit_replace
 
-def bench(fn, num_warmups: int = 10, num_tests: int = 50, post_fn=None):
-    # Flush L2 cache with 256 MB data
-    torch.cuda.synchronize()
-    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
-
-    # Warmup
-    for _ in range(num_warmups):
-        fn()
-
-    # Flush L2
-    cache.zero_()
-
-    # Testing
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
-    for i in range(num_tests):
-        # Record
-        start_events[i].record()
-        fn()
-        end_events[i].record()
-        if post_fn is not None:
-            post_fn()
-    torch.cuda.synchronize()
-
-    times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])[1:]
-    return np.average(times), np.min(times), np.max(times)
-
 def usc_hit_replace_native(
     grounded_weights,
     miss_mask,
@@ -66,31 +39,32 @@ def test_usc_hit_replace():
     for num_tokens in [8, 1024, 2048, 4096]:
         for topk in [8, 16, 32]:
             for num_experts in [32, 64, 128]:
-                # NOTE: ~miss_mask will lead to bitwise inversion, which is not what we want
-                grounded_weights, estimated_weights, grounded_idx, estimated_idx, hit_mask, miss_mask = \
-                    generate_test_data(num_tokens=num_tokens, topk=topk, num_experts=num_experts, dtype=torch.bfloat16, device='cuda')
+                for dtype in [torch.bfloat16, torch.float32]:
+                    # NOTE: ~miss_mask will lead to bitwise inversion, which is not what we want
+                    grounded_weights, estimated_weights, grounded_idx, estimated_idx, hit_mask, miss_mask = \
+                        generate_test_data(num_tokens=num_tokens, topk=topk, num_experts=num_experts, dtype=dtype, device='cuda')
 
-                native_lambda = lambda: usc_hit_replace_native(grounded_weights, miss_mask, estimated_weights, hit_mask)
+                    native_lambda = lambda: usc_hit_replace_native(grounded_weights, miss_mask, estimated_weights, hit_mask)
 
-                cuda_lambda = lambda: moe_usc_hit_replace(grounded_weights, miss_mask, estimated_weights, hit_mask)
+                    cuda_lambda = lambda: moe_usc_hit_replace(grounded_weights, miss_mask, estimated_weights, hit_mask)
 
-                # check accuracy
-                output_ref = native_lambda()
-                output_ref_clone = output_ref.clone()
-                torch.cuda.synchronize()
-                output_cuda = cuda_lambda()
-                torch.testing.assert_close(output_ref, output_ref_clone, rtol=1e-5, atol=1e-5)
-                torch.testing.assert_close(output_cuda, output_ref, rtol=1e-5, atol=1e-5)
-                print(f"✓ Basic test passed for num_tokens={num_tokens}, topk={topk}, num_experts={num_experts}")
+                    # check accuracy
+                    output_ref = native_lambda()
+                    output_ref_clone = output_ref.clone()
+                    torch.cuda.synchronize()
+                    output_cuda = cuda_lambda()
+                    torch.testing.assert_close(output_ref, output_ref_clone, rtol=1e-5, atol=1e-5)
+                    torch.testing.assert_close(output_cuda, output_ref, rtol=1e-5, atol=1e-5)
+                    print(f"✓ Basic test passed for num_tokens={num_tokens}, topk={topk}, num_experts={num_experts}, dtype={dtype}")
 
-                # benchmark
-                torch.cuda.synchronize()
-                quantiles = [0.2, 0.5, 0.8]
-                ms_native, min_ms_native, max_ms_native = triton.testing.do_bench(native_lambda, quantiles=quantiles)
-                ms_cuda, min_ms_cuda, max_ms_cuda = triton.testing.do_bench(cuda_lambda, quantiles=quantiles)
+                    # benchmark
+                    torch.cuda.synchronize()
+                    quantiles = [0.2, 0.5, 0.8]
+                    ms_native, min_ms_native, max_ms_native = triton.testing.do_bench(native_lambda, quantiles=quantiles)
+                    ms_cuda, min_ms_cuda, max_ms_cuda = triton.testing.do_bench(cuda_lambda, quantiles=quantiles)
 
-                print(f"Native: {ms_native:.4f} ms, {min_ms_native:.4f} ms, {max_ms_native:.4f} ms")
-                print(f"CUDA: {ms_cuda:.4f} ms, {min_ms_cuda:.4f} ms, {max_ms_cuda:.4f} ms")
+                    print(f"Native: {ms_native:.4f} ms, {min_ms_native:.4f} ms, {max_ms_native:.4f} ms")
+                    print(f"CUDA: {ms_cuda:.4f} ms, {min_ms_cuda:.4f} ms, {max_ms_cuda:.4f} ms")
 
 
 def usc_verify_cache_mask_native(

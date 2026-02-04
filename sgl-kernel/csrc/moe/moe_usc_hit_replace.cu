@@ -105,9 +105,9 @@ __global__ void moe_usc_hit_replace_kernel(
 #endif
 
       if (can_exchange) {
-        __half value_as_half = *reinterpret_cast<__half*>(&value_to_send);
-        __half received = __shfl_xor_sync(mask_sync, value_as_half, 1);
-        scalar_t recevied_value = *reinterpret_cast<scalar_t*>(&received);
+        scalar_t recevied_value = static_cast<scalar_t>(
+          __shfl_xor_sync(mask_sync, static_cast<float>(value_to_send), 1)
+        );
 
         if (role == 1 && will_recv) {
           hit_weights[offset + consumer_idx] = recevied_value;
@@ -157,18 +157,6 @@ void moe_usc_hit_replace(
         num_tokens,
         topk
     );
-    
-    // Add error checking
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      printf("Kernel launch error: %s\n", cudaGetErrorString(err));
-    }
-    
-    // This will hang if kernel hangs
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) {
-      printf("Kernel execution error: %s\n", cudaGetErrorString(err));
-    }
     
     return true;
   });
