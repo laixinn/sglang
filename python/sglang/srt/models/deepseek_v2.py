@@ -1070,12 +1070,15 @@ class DeepseekV2MoE(nn.Module):
         state.hidden_states_mlp_output = final_hidden_states
 
     def op_usc_estimate_a(self, state):
-        state.estimate_event = self.usc_cache.index_estimate_a(
-            self.usc_index_estimate,
-            state.forward_batch.forward_mode,
-            state.hidden_states_mlp_input,
-            state.forward_batch.num_token_non_padded,
-        )
+        if self.has_usc_estimation:
+            state.estimate_event = self.usc_cache.index_estimate_a(
+                self.usc_index_estimate,
+                state.forward_batch.forward_mode,
+                state.hidden_states_mlp_input,
+                state.forward_batch.num_token_non_padded,
+            )
+        else:
+            state.estimate_event = None
 
     def op_usc_estimate_b(self, state):
         if (estimate_event := state.pop("estimate_event")) is not None:
@@ -1106,38 +1109,45 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def op_usc_hit_a(self, state):
-        # state.estimated_topk = self.usc_cache._get_hit_cache(
-        #     state.pop("estimated_topk"), 
-        #     state.hit_mask,
-        # )
-
-        estimated_topk = state.pop("estimated_topk")
-        grounded_topk = state.topk_output
-        hit_mask = state.hit_mask
-        miss_mask = state.miss_mask
-        hit_topk_idx = estimated_topk.topk_ids
-        hit_topk_weights = estimated_topk.topk_weights
-
-        hit_topk_idx.masked_fill_(~hit_mask, -1)
-        # TODO: this kernel temporarily considers small topk, optimize this
-        # hit_topk_weights[hit_mask] = grounded_topk.topk_weights[~miss_mask]
-        # hit_topk_weights = moe_usc_hit_replace(grounded_topk.topk_weights, miss_mask, hit_topk_weights, hit_mask)
-        hit_topk_weights.masked_fill_(~hit_mask, 0.0)
-
-        hit_topk_output = StandardTopKOutput(
-            topk_weights=hit_topk_weights,
-            topk_ids=hit_topk_idx,
-            router_logits=grounded_topk.router_logits,
-        )
-
-        state.estimated_topk = hit_topk_output
-
-        # state.estimated_topk = state.topk_output
+        state.estimated_topk.topk_weights.fill_(1.0)
 
         state.hit_varlen_combine_output = self.usc_cache.hit_forward_a(
             experts=self.experts,
             hidden_states=state.hidden_states_mlp_input,
-            estimated_topk=state.pop("estimated_topk"),
+            estimated_topk=state.estimated_topk,
+        )
+        
+    def op_usc_hit_a_up(self, state):
+        assert isinstance(self.experts, FusedMoE)
+        state.hit_varlen_intermediate_output = self.usc_cache.hit_forward_stage_a(
+            experts=self.experts.forward_stages,
+            hidden_states=state.hidden_states_mlp_input,
+            estimated_topk=state.estimated_topk,
+            stage=0,
+        )
+
+    def op_usc_hit_a_down(self, state):
+        corrected_topk = self.usc_cache._get_hit_cache(
+            state.pop("estimated_topk"), 
+            state.topk_output,
+            state.miss_mask,
+            state.hit_mask,
+        )
+
+        state.hit_varlen_combine_output = self.usc_cache.hit_forward_stage_a(
+            experts=self.experts.forward_stages,
+            hidden_states=state.hidden_states_mlp_input,
+            estimated_topk=corrected_topk,
+            stage=1,
+            dispatch_output=state.pop("hit_varlen_intermediate_output"),
+        )
+
+    def op_usc_hit_a_up(self, state):
+        state.hit_varlen_intermediate_output = self.usc_cache.hit_forward_stage_a(
+            experts=self.experts.forward_stages,
+            hidden_states=state.hidden_states_mlp_input,
+            estimated_topk=state.estimated_topk,
+            stage=0,
         )
 
     def op_usc_hit_b(self, state):
@@ -1149,7 +1159,7 @@ class DeepseekV2MoE(nn.Module):
             self.usc_cache.miss_forward(
                 experts=self.experts,
                 hidden_states=state.hidden_states_mlp_input,
-                grounded_topk=state.pop("topk_output"),
+                grounded_topk=state.topk_output,
                 miss_mask=state.miss_mask,
             )
 
@@ -1161,6 +1171,8 @@ class DeepseekV2MoE(nn.Module):
             state.pop("hit_mask"),
             state.pop("miss_mask"),
             self.routed_scaling_factor,
+            state.pop("estimated_topk"),
+            state.pop("topk_output"),
         )
 
     def op_usc_output(self, state):

@@ -2,7 +2,8 @@
 
 import logging
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable
+from contextlib import contextmanager
 
 import torch
 

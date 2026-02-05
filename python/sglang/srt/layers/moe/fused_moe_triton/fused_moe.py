@@ -701,8 +701,11 @@ def fused_moe(
 
 def fused_moe_post_sum(
     intermediate_cache3: torch.Tensor,
-    routed_scaling_factor: float,
+    routed_scaling_factor: Optional[float] = None,
 ):
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
+
     assert intermediate_cache3.ndim == 3
 
     num_tokens, topk, hidden_size = intermediate_cache3.shape
