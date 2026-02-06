@@ -157,38 +157,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 
-  m.def(
-      "cutlass_scaled_fp4_mm(Tensor! out, Tensor a, Tensor b,"
-      "                      Tensor block_scale_a, Tensor block_scale_b,"
-      "                      Tensor alpha) -> ()");
-  m.impl("cutlass_scaled_fp4_mm", torch::kCUDA, &cutlass_scaled_fp4_mm);
-
-  m.def(
-      "scaled_fp4_quant(Tensor! output, Tensor! input,"
-      "                 Tensor! output_scale, Tensor! input_scale) -> ()");
-  m.impl("scaled_fp4_quant", torch::kCUDA, &scaled_fp4_quant);
-
   m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   m.impl("dsv3_fused_a_gemm", torch::kCUDA, &dsv3_fused_a_gemm);
-
-  // Compute NVFP4 experts quantization.
-  m.def(
-      "scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
-      "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
-      "Tensor output_scale_offset_by_experts) -> ()");
-  m.impl("scaled_fp4_experts_quant", torch::kCUDA, &scaled_fp4_experts_quant);
-
-  m.def(
-      "silu_and_mul_scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
-      "Tensor input, Tensor input_global_scale, Tensor mask, bool use_silu_and_mul) -> ()");
-  m.impl("silu_and_mul_scaled_fp4_experts_quant", torch::kCUDA, &silu_and_mul_scaled_fp4_experts_quant);
-
-  m.def(
-      "cutlass_fp4_group_mm(Tensor! output, Tensor a, Tensor b,"
-      "Tensor a_blockscale, Tensor b_blockscale, Tensor alphas,"
-      "Tensor ab_strides, Tensor c_strides, Tensor problem_sizes,"
-      " Tensor expert_offsets, Tensor sf_offsets) -> ()");
-  m.impl("cutlass_fp4_group_mm", torch::kCUDA, &cutlass_fp4_group_mm);
 
   m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   m.impl("dsv3_router_gemm", torch::kCUDA, &dsv3_router_gemm);
@@ -226,6 +196,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
       "pad_sorted_token_ids) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
+
+  m.def(
+      "moe_usc_hit_replace(Tensor grounded_weights, Tensor miss_mask, Tensor! hit_weights, Tensor hit_mask) -> ()");
+  m.impl("moe_usc_hit_replace", torch::kCUDA, &moe_usc_hit_replace);
 
   m.def(
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "
@@ -583,14 +557,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "stride_a, Tensor stride_b, Tensor stride_d, Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> "
       "()");
   m.impl("es_fp8_blockwise_scaled_grouped_mm", &es_fp8_blockwise_scaled_grouped_mm);
-  m.def(
-      "es_sm100_mxfp8_blockscaled_grouped_mm(Tensor a, Tensor b, Tensor sfa, Tensor sfb, Tensor d, Tensor "
-      "problem_sizes, Tensor expert_offsets, Tensor blockscale_offsets) -> ()");
-  m.impl("es_sm100_mxfp8_blockscaled_grouped_mm", &es_sm100_mxfp8_blockscaled_grouped_mm);
-  m.def(
-      "es_sm100_mxfp8_blockscaled_grouped_quant(Tensor input, Tensor problem_sizes, Tensor expert_offsets, Tensor "
-      "blockscale_offsets, Tensor quant_output, Tensor scale_factor) -> () ");
-  m.impl("es_sm100_mxfp8_blockscaled_grouped_quant", &es_sm100_mxfp8_blockscaled_grouped_quant);
 
   /*
    * From fast-hadamard-transform
