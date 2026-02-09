@@ -1073,11 +1073,16 @@ class DeepseekV2MoE(nn.Module):
         if self.has_usc_estimation:
             state.estimate_event = self.usc_cache.index_estimate_a(
                 self.usc_index_estimate,
-                state.forward_batch.forward_mode,
-                state.hidden_states_mlp_input,
-                state.forward_batch.num_token_non_padded,
+                forward_mode=state.forward_batch.forward_mode,
+                hidden_states=state.hidden_states_mlp_input,
+                num_token_non_padded=state.forward_batch.num_token_non_padded,
             )
+            # state.estimate_event = self.usc_cache.index_estimate_a(
+            #     self.usc_index_estimate_v2,
+            #     topk_output=state.pop("topk_output"),
+            # )
         else:
+            # state.pop("topk_output")
             state.estimate_event = None
 
     def op_usc_estimate_b(self, state):
@@ -1107,6 +1112,10 @@ class DeepseekV2MoE(nn.Module):
         state.hit_mask, state.miss_mask = self.usc_cache._verify_cache(
             state.topk_output, state.estimated_topk
         )
+        # state.forward_batch.usc_hit_count += (~state.miss_mask).sum()
+        # state.forward_batch.usc_total_count += state.miss_mask.numel()
+        # if self.layer_id >= 60:
+        #     print(f"{self.layer_id=}, hit rate: {state.forward_batch.usc_hit_count / state.forward_batch.usc_total_count * 100:.2f}%", flush=True)
 
     def op_usc_hit_a(self, state):
         state.estimated_topk.topk_weights.fill_(1.0)
@@ -1115,39 +1124,6 @@ class DeepseekV2MoE(nn.Module):
             experts=self.experts,
             hidden_states=state.hidden_states_mlp_input,
             estimated_topk=state.estimated_topk,
-        )
-        
-    def op_usc_hit_a_up(self, state):
-        assert isinstance(self.experts, FusedMoE)
-        state.hit_varlen_intermediate_output = self.usc_cache.hit_forward_stage_a(
-            experts=self.experts.forward_stages,
-            hidden_states=state.hidden_states_mlp_input,
-            estimated_topk=state.estimated_topk,
-            stage=0,
-        )
-
-    def op_usc_hit_a_down(self, state):
-        corrected_topk = self.usc_cache._get_hit_cache(
-            state.pop("estimated_topk"), 
-            state.topk_output,
-            state.miss_mask,
-            state.hit_mask,
-        )
-
-        state.hit_varlen_combine_output = self.usc_cache.hit_forward_stage_a(
-            experts=self.experts.forward_stages,
-            hidden_states=state.hidden_states_mlp_input,
-            estimated_topk=corrected_topk,
-            stage=1,
-            dispatch_output=state.pop("hit_varlen_intermediate_output"),
-        )
-
-    def op_usc_hit_a_up(self, state):
-        state.hit_varlen_intermediate_output = self.usc_cache.hit_forward_stage_a(
-            experts=self.experts.forward_stages,
-            hidden_states=state.hidden_states_mlp_input,
-            estimated_topk=state.estimated_topk,
-            stage=0,
         )
 
     def op_usc_hit_b(self, state):
@@ -1164,7 +1140,6 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def op_usc_reduce(self, state):
-        
         state.hidden_states_after_combine = self.usc_cache.reduce(
             state.pop("hit_varlen_combine_output"),
             state.pop("miss_varlen_combine_output"),
@@ -1202,6 +1177,9 @@ class DeepseekV2MoE(nn.Module):
             estimated_topk = self.topk.full_topk_output(hidden_states.device, hidden_states.shape[0], True)
 
         return estimated_topk
+
+    def usc_index_estimate_v2(self, topk_output):
+        return topk_output
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:

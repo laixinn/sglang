@@ -15,9 +15,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 from sglang.srt.layers.moe.usc.decode_cache import DecodeCache
 
-from sglang.srt.batch_overlap.operations import _StateDict
-from sglang.srt.layers.moe.topk import VarlenTopKOutput, StandardTopKOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe_post_sum
+from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sgl_kernel import moe_usc_hit_replace
 
 if TYPE_CHECKING:
@@ -205,6 +205,7 @@ class USCTPMoECache(DecodeCache):
             experts.moe_runner_config, 
             no_combine=True, 
             inplace=False, 
+            num_warps=2,
         )
         self.experts = experts
 
@@ -219,21 +220,10 @@ class USCTPMoECache(DecodeCache):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         topk_idx = topk_output.topk_ids
 
-        # reset recall
-        # TODO: CHECK THIS
-        self._last_tp = 0
-        self._last_fn = 0
-
         if cache_topk_output is not None:
             cache_topk_idx = cache_topk_output.topk_ids
 
             hit_token_mask, miss_token_mask = verify_cache_mask_triton(cache_topk_idx, topk_idx)
-            
-            # # calculate recall
-            # tp = hit_token_mask.sum().item()  # an activated expert is predicted
-            # fn = miss_token_mask.sum().item() # anactivated expert is not predicted
-            # self._last_tp = tp
-            # self._last_fn = fn
         else:
             hit_token_mask = torch.zeros_like(topk_idx, dtype=torch.bool)
             miss_token_mask = torch.ones_like(topk_idx, dtype=torch.bool)
@@ -283,12 +273,10 @@ class USCTPMoECache(DecodeCache):
     def index_estimate_a(
         self, 
         index_estimate_fn: Callable,
-        forward_mode: ForwardMode,
-        hidden_states: torch.Tensor,
-        num_token_non_padded: torch.Tensor,
+        **kwargs,
     ):
         return self._async_execute(
-            lambda: index_estimate_fn(forward_mode, hidden_states, num_token_non_padded)
+            lambda: index_estimate_fn(**kwargs)
         )
 
     def index_estimate_b(self, tensor_wrapper: StreamTensorWrapper):

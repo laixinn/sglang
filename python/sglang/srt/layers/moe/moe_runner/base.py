@@ -46,6 +46,7 @@ class MoeRunnerConfig:
 
     filter_expert: bool = True
 
+    num_warps: Optional[int] = -1
 
 @dataclass
 class RunnerInput(ABC):

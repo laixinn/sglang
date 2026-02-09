@@ -157,16 +157,17 @@ def _compute_moe_usc_layer_operations_strategy_tbo(
 ) -> OperationsStrategy:
     assert layer.is_layer_sparse, "dense layer TBO not yet implemented"
     if forward_mode == ForwardMode.EXTEND:
-        return _compute_moe_usc_prefill(layer)
+        assert False, "DeepSeek V3.2 Unified Sparse Cache prefill brings negative performance"
+        return _compute_moe_usc_decode(layer)
     elif (
         forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
     ):
         # TODO: with attn, this prefill strategy might not be applicable to decode
-        return _compute_moe_usc_prefill(layer)
+        return _compute_moe_usc_decode(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
 
-def _compute_moe_usc_prefill(layer):
+def _compute_moe_usc_decode(layer):
     device_properties = torch.cuda.get_device_properties(device="cuda")
     total_num_sms = device_properties.multi_processor_count
     deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
