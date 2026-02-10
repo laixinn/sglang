@@ -403,6 +403,8 @@ class ForwardBatch:
 
     # For USC
     usc_dispatch_output: Optional[StandardDispatchOutput] = None
+    usc_hit_count: int = 0
+    usc_total_count: int = 0
 
     @classmethod
     def init_new(
@@ -1300,3 +1302,41 @@ def create_chunked_prefix_cache_kv_indices(
         tl.store(
             chunk_kv_indices_ptr + chunk_kv_indices_offset + offset, data, mask=mask
         )
+
+
+class USCStatBuffers:
+    """Persistent GPU buffers for USC (Unified Speculative Cache) hit rate statistics.
+
+    These buffers are shared between the model forward (which may run inside a CUDA graph)
+    and model_runner (which reads the stats after graph replay).
+
+    During CUDA graph capture, the zero_() and add_() operations on these tensors are
+    recorded. During replay, they execute on the GPU with updated data, so the buffers
+    always contain the latest statistics after replay finishes.
+    """
+
+    hit_buf: Optional[torch.Tensor] = None   # [1] int64 on GPU, accumulated hit count
+    total_buf: Optional[torch.Tensor] = None  # [1] int64 on GPU, accumulated total count
+
+    @classmethod
+    def ensure_initialized(cls, device: torch.device):
+        """Lazily initialize the GPU buffers on the given device."""
+        if cls.hit_buf is None:
+            cls.hit_buf = torch.zeros(1, dtype=torch.int64, device=device)
+            cls.total_buf = torch.zeros(1, dtype=torch.int64, device=device)
+
+    @classmethod
+    def read_and_log(cls, step: int, log_interval: int = 100) -> None:
+        """Read USC stats from GPU and log periodically. Safe to call after CUDA graph replay."""
+        if cls.hit_buf is None:
+            return
+        if step % log_interval != 1:
+            return
+        hit = cls.hit_buf.item()
+        total = cls.total_buf.item()
+        if total > 0:
+            print(
+                f"[decode step {step}] USC hit rate: {hit / total * 100:.2f}% "
+                f"({hit}/{total})",
+                flush=True,
+            )

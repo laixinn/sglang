@@ -114,6 +114,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    USCStatBuffers,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.input_buffers import GraphInputBuffers
@@ -2246,6 +2247,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
+
+        # Log USC hit rate statistics after forward (works for both CUDA graph
+        # replay and normal forward paths). The GPU buffers were updated inside
+        # op_usc_verify; here we periodically sync to CPU and print.
+        if forward_batch.forward_mode.is_decode():
+            self._usc_decode_step = getattr(self, "_usc_decode_step", 0) + 1
+            USCStatBuffers.read_and_log(self._usc_decode_step, log_interval=100)
 
         return output
 

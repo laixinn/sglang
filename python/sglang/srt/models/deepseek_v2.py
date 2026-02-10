@@ -132,7 +132,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+    USCStatBuffers,
+)
 from sglang.srt.model_loader.utils import (
     maybe_executor_submit,
     should_async_load,
@@ -1073,16 +1077,18 @@ class DeepseekV2MoE(nn.Module):
         if self.has_usc_estimation:
             state.estimate_event = self.usc_cache.index_estimate_a(
                 self.usc_index_estimate,
-                forward_mode=state.forward_batch.forward_mode,
-                hidden_states=state.hidden_states_mlp_input,
-                num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    forward_mode=state.forward_batch.forward_mode,
+                    hidden_states=state.hidden_states_for_estimate,
+                    num_token_non_padded=state.forward_batch.num_token_non_padded,
             )
+            state.pop("hidden_states_for_estimate")
             # state.estimate_event = self.usc_cache.index_estimate_a(
             #     self.usc_index_estimate_v2,
             #     topk_output=state.pop("topk_output"),
             # )
         else:
             # state.pop("topk_output")
+            state.pop("hidden_states_for_estimate")
             state.estimate_event = None
 
     def op_usc_estimate_b(self, state):
@@ -1112,10 +1118,18 @@ class DeepseekV2MoE(nn.Module):
         state.hit_mask, state.miss_mask = self.usc_cache._verify_cache(
             state.topk_output, state.estimated_topk
         )
-        # state.forward_batch.usc_hit_count += (~state.miss_mask).sum()
-        # state.forward_batch.usc_total_count += state.miss_mask.numel()
-        # if self.layer_id >= 60:
-        #     print(f"{self.layer_id=}, hit rate: {state.forward_batch.usc_hit_count / state.forward_batch.usc_total_count * 100:.2f}%", flush=True)
+        # Accumulate USC hit/miss stats on GPU (safe for CUDA graph capture & replay).
+        # The zero_() and add_() ops are captured into the graph; during replay they
+        # execute on the GPU with the latest data, so USCStatBuffers always holds the
+        # up-to-date counts after replay finishes.
+        USCStatBuffers.ensure_initialized(state.miss_mask.device)
+        # Reset counters at the first MoE layer of each forward pass
+        if self.layer_id == self.config.first_k_dense_replace:
+            USCStatBuffers.hit_buf.zero_()
+            USCStatBuffers.total_buf.zero_()
+        # Accumulate (GPU-only, no CPU-GPU sync)
+        USCStatBuffers.hit_buf.add_((state.hit_mask).sum().to(torch.int64))
+        USCStatBuffers.total_buf.add_(state.hit_mask.numel())
 
     def op_usc_hit_a(self, state):
         state.estimated_topk.topk_weights.fill_(1.0)
@@ -3030,6 +3044,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         state.use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             state.forward_batch
         )
+        state.hidden_states_for_estimate = state.hidden_states_mlp_input.clone()
 
     def op_usc_comm_prepare_attn(
         self,
