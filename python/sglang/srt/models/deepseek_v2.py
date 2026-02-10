@@ -1112,10 +1112,10 @@ class DeepseekV2MoE(nn.Module):
         state.hit_mask, state.miss_mask = self.usc_cache._verify_cache(
             state.topk_output, state.estimated_topk
         )
-        # state.forward_batch.usc_hit_count += (~state.miss_mask).sum()
-        # state.forward_batch.usc_total_count += state.miss_mask.numel()
-        # if self.layer_id >= 60:
-        #     print(f"{self.layer_id=}, hit rate: {state.forward_batch.usc_hit_count / state.forward_batch.usc_total_count * 100:.2f}%", flush=True)
+        state.forward_batch.usc_hit_count += (~state.miss_mask).sum()
+        state.forward_batch.usc_total_count += state.miss_mask.numel()
+        if self.layer_id >= 60:
+            print(f"{self.layer_id=}, hit rate: {state.forward_batch.usc_hit_count / state.forward_batch.usc_total_count * 100:.2f}%", flush=True)
 
     def op_usc_hit_a(self, state):
         state.estimated_topk.topk_weights.fill_(1.0)

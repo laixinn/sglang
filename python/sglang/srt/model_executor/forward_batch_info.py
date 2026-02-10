@@ -402,7 +402,8 @@ class ForwardBatch:
     return_hidden_states_before_norm: bool = False
 
     # For USC
-    usc_dispatch_output: Optional[StandardDispatchOutput] = None
+    usc_hit_count: int = 0
+    usc_total_count: int = 0
 
     @classmethod
     def init_new(
