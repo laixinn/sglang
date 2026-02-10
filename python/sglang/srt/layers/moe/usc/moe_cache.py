@@ -187,12 +187,17 @@ def verify_cache_mask_triton(
 
 
 class StreamTensorWrapper:
-    def __init__(self, tensor: torch.Tensor, event: torch.cuda.Event):
+    def __init__(self, tensor: torch.Tensor, event: torch.cuda.Event, sync: bool = False):
         self.tensor = tensor
         self.event = event
+        self.sync = sync
+
+        if self.sync:
+            self.event.wait()
 
     def get_tensor(self):
-        self.event.wait()
+        if not self.sync:
+            self.event.wait()
         return self.tensor
 
 
@@ -205,7 +210,11 @@ class USCTPMoECache(DecodeCache):
             experts.moe_runner_config, 
             no_combine=True, 
             inplace=False, 
-            num_warps=2,
+            down_num_warps=4,
+        )
+        self.miss_moe_runner_config = replace(
+            experts.moe_runner_config,
+            up_num_warps=4,
         )
         self.experts = experts
 
@@ -330,10 +339,11 @@ class USCTPMoECache(DecodeCache):
 
         # support varlen topk moe
         # standard combine output with topk=-1 positions excluded from combine
-        miss_varlen_combine_output = experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+        with override_moe_config(experts.quant_method.runner, self.miss_moe_runner_config):
+            miss_varlen_combine_output = experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
 
         return miss_varlen_combine_output
 

@@ -87,7 +87,8 @@ def inplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
-    num_warps: Optional[int] = -1,
+    up_num_warps: Optional[int] = -1,
+    down_num_warps: Optional[int] = -1,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -118,7 +119,8 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
-        num_warps=num_warps,
+        up_num_warps=up_num_warps,
+        down_num_warps=down_num_warps,
     )
 
 
@@ -151,7 +153,8 @@ def outplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
-    num_warps: Optional[int] = -1,
+    up_num_warps: Optional[int] = -1,
+    down_num_warps: Optional[int] = -1,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -182,7 +185,8 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
-        num_warps=num_warps,
+        up_num_warps=up_num_warps,
+        down_num_warps=down_num_warps,
     )
 
 
@@ -242,7 +246,8 @@ def fused_experts(
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
-            num_warps=moe_runner_config.num_warps,
+            up_num_warps=moe_runner_config.up_num_warps,
+            down_num_warps=moe_runner_config.down_num_warps,
         )
         return hidden_states
     else:
@@ -274,7 +279,8 @@ def fused_experts(
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
-            num_warps=moe_runner_config.num_warps,
+            up_num_warps=moe_runner_config.up_num_warps,
+            down_num_warps=moe_runner_config.down_num_warps,
         )
 
 
@@ -326,7 +332,8 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
-    num_warps: Optional[int] = -1,
+    up_num_warps: Optional[int] = -1,
+    down_num_warps: Optional[int] = -1,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -427,6 +434,10 @@ def fused_experts_impl(
                 and down_config.pop("USE_TMA", False)
             )
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
+
+        if up_num_warps != -1:
+            config = {**config}
+            config["num_warps"] = up_num_warps
 
         padded_tokens = (
             min(tokens_in_chunk * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
@@ -533,12 +544,12 @@ def fused_experts_impl(
         else:
             raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-        if num_warps != -1:
+        if down_num_warps != -1:
             config = {**config}
-            config["num_warps"] = max(config["num_warps"] // 2, 1)
+            config["num_warps"] = down_num_warps
             if down_moe_use_tma:
                 down_config = {**down_config}
-                down_config["num_warps"] = max(down_config["num_warps"] // 2, 1)
+                down_config["num_warps"] = down_num_warps
 
         invoke_fused_moe_kernel(
             intermediate_cache2,
