@@ -1074,15 +1074,11 @@ class DeepseekV2MoE(nn.Module):
             state.estimate_event = self.usc_cache.index_estimate_a(
                 self.usc_index_estimate,
                 forward_mode=state.forward_batch.forward_mode,
-                hidden_states=state.hidden_states_mlp_input,
+                hidden_states=state.pop("hidden_states_for_estimate"),
                 num_token_non_padded=state.forward_batch.num_token_non_padded,
             )
-            # state.estimate_event = self.usc_cache.index_estimate_a(
-            #     self.usc_index_estimate_v2,
-            #     topk_output=state.pop("topk_output"),
-            # )
         else:
-            # state.pop("topk_output")
+            state.pop("hidden_states_for_estimate")
             state.estimate_event = None
 
     def op_usc_estimate_b(self, state):
@@ -1112,11 +1108,7 @@ class DeepseekV2MoE(nn.Module):
         state.hit_mask, state.miss_mask = self.usc_cache._verify_cache(
             state.topk_output, state.estimated_topk
         )
-        state.forward_batch.usc_hit_count += (~state.miss_mask).sum()
-        state.forward_batch.usc_total_count += state.miss_mask.numel()
-        if self.layer_id >= 60:
-            print(f"{self.layer_id=}, hit rate: {state.forward_batch.usc_hit_count / state.forward_batch.usc_total_count * 100:.2f}%", flush=True)
-
+        
     def op_usc_hit_a(self, state):
         state.estimated_topk.topk_weights.fill_(1.0)
 
@@ -1177,9 +1169,6 @@ class DeepseekV2MoE(nn.Module):
             estimated_topk = self.topk.full_topk_output(hidden_states.device, hidden_states.shape[0], True)
 
         return estimated_topk
-
-    def usc_index_estimate_v2(self, topk_output):
-        return topk_output
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -3030,6 +3019,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         state.use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             state.forward_batch
         )
+        # fused moe is inplace
+        state.hidden_states_for_estimate = state.hidden_states_mlp_input.clone()
 
     def op_usc_comm_prepare_attn(
         self,
