@@ -21,23 +21,29 @@ print("Building moe_usc_hit_replace kernel...")
 print(f"  CUDA kernel: {sgl_kernel_dir}/csrc/moe/moe_usc_hit_replace.cu")
 print(f"  Include dir: {sgl_kernel_dir}/include")
 
-module = load(
-    name="moe_usc_ext",
-    sources=[
-        os.path.join(os.path.dirname(__file__), "wrapper.cpp"),
-        os.path.join(sgl_kernel_dir, "csrc/moe/moe_usc_hit_replace.cu"),
-    ],
-    extra_include_paths=[
-        os.path.join(sgl_kernel_dir, "include"),
-    ],
-    extra_cuda_cflags=[
-        "-gencode=arch=compute_90a,code=sm_90a",
-        "-O3",
-    ],
-    extra_cflags=["-O3"],
-    build_directory=os.path.dirname(__file__),
-    verbose=True,
-)
+try:
+    module = load(
+        name="moe_usc_ext",
+        sources=[
+            os.path.join(os.path.dirname(__file__), "wrapper.cpp"),
+            os.path.join(sgl_kernel_dir, "csrc/moe/moe_usc_hit_replace.cu"),
+        ],
+        extra_include_paths=[
+            os.path.join(sgl_kernel_dir, "include"),
+        ],
+        extra_cuda_cflags=[
+            "-gencode=arch=compute_90a,code=sm_90a",
+            "-O3",
+        ],
+        extra_cflags=["-O3"],
+        build_directory=os.path.dirname(__file__),
+        verbose=True,
+    )
+except ImportError:
+    # load() tries to import the .so as a Python module, but our wrapper
+    # uses TORCH_LIBRARY_FRAGMENT (not PYBIND11_MODULE), so the import
+    # fails. The .so is already compiled at this point — ignore the error.
+    pass
 
 # Find the built .so file
 so_file = None

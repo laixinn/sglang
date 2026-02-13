@@ -8,7 +8,7 @@ from sglang.srt.batch_overlap.operations import Operation
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.layers.moe.utils import is_usc_enabled
-
+from sglang.srt.utils import logger
 
 @dataclass
 class OperationsStrategy:
@@ -157,6 +157,7 @@ def _compute_moe_usc_layer_operations_strategy_tbo(
 ) -> OperationsStrategy:
     assert layer.is_layer_sparse, "dense layer TBO not yet implemented"
     if forward_mode == ForwardMode.EXTEND:
+        return _compute_attn_usc_prefill(layer)
         assert False, "DeepSeek V3.2 Unified Sparse Cache prefill brings negative performance"
         return _compute_moe_usc_decode(layer)
     elif (
@@ -166,6 +167,46 @@ def _compute_moe_usc_layer_operations_strategy_tbo(
         return _compute_moe_usc_decode(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
+
+def _compute_attn_usc_prefill(layer):
+    device_properties = torch.cuda.get_device_properties(device="cuda")
+    total_num_sms = device_properties.multi_processor_count
+    deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+
+    # TODO: add YieldOperation
+    return OperationsStrategy(
+        deep_gemm_num_sms=deep_gemm_num_sms,
+        tbo_delta_stages=0,
+        operations=[
+            layer.op_usc_comm_prepare_attn,
+            layer.self_attn.op_usc_estimate_b,  
+            layer.self_attn.op_usc_prepare,    
+            layer.self_attn.op_usc_hit_a,       
+            layer.self_attn.op_usc_topk,        
+            layer.self_attn.op_usc_verify,     
+            layer.self_attn.op_usc_miss_reduce,     
+            layer.self_attn.op_usc_estimate_a, 
+            layer.op_usc_comm_prepare_mlp,
+            
+            layer.mlp.op_usc_estimate_b, # estimated topk is ready
+
+            layer.mlp.op_usc_hit_a,  # overlap hit forward with op_gate+op_select_experts
+
+            layer.mlp.op_usc_topk,
+            
+            layer.mlp.op_usc_verify, # sync: use true and estimated topk
+
+            layer.mlp.op_usc_miss,   # get partial true topk results and shared experts
+            
+            layer.mlp.op_usc_hit_b,  # get full estimated topk results
+            layer.mlp.op_usc_reduce, # sync: take partial hit results, combine and then reduce
+
+            layer.mlp.op_usc_estimate_a, # launch topk estimation, old results have been cleaned
+            layer.mlp.op_usc_output,
+
+            layer.op_usc_comm_postprocess_layer,
+        ],
+    )
 
 def _compute_moe_usc_decode(layer):
     device_properties = torch.cuda.get_device_properties(device="cuda")
@@ -179,7 +220,9 @@ def _compute_moe_usc_decode(layer):
         operations=[
             layer.op_usc_comm_prepare_attn,
             layer.self_attn.op_prepare,
-            layer.self_attn.op_core,
+            layer.self_attn.op_core, 
+            layer.self_attn.op_usc_estimate_a, 
+
             layer.op_usc_comm_prepare_mlp,
             
             layer.mlp.op_usc_estimate_b, # estimated topk is ready

@@ -1,12 +1,13 @@
 #!/bin/bash
-cd /home/hadoop-djst-algoplat/sglang
+
+# 编译 FlashMLA 算子
+# cd FlashMLA-src 
+# MAX_JOBS=4 FLASH_MLA_FORCE_CXX=g++-12 FLASH_MLA_DISABLE_SM100=1 python setup.py build_ext 
 
 unset http_proxy && unset https_proxy && unset HTTP_PROXY && unset HTTPS_PROXY
 
-# export FLASHINFER_DISABLE_VERSION_CHECK=1
-# # DeepEP Auto requires DeepGEMM; keep JIT enabled but disable pre-compilation to avoid large one-time allocations
-# export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
-# export SGLANG_ENABLE_JIT_DEEPGEMM=1
+# Debug: force synchronous CUDA execution to pinpoint OOB kernel
+export USC_DEBUG_SYNC=1
 
 MODEL_PATH=/home/hadoop-djst-algoplat/models/deepseek-ai/DeepSeek-V3.2-Exp/
 
@@ -31,10 +32,9 @@ python3 -m sglang.launch_server \
         2>&1 | tee server.log &
 
 
-
-# gsm8k
+# gsm8k测试
+# nohup python3 benchmark/gsm8k/bench_sglang.py --host http://localhost --port 8418 --num-questions 100 > gsm8k_bench.log 2>&1 &
 # nohup - 防止终端关闭后进程被杀
 # > gsm8k_bench.log 2>&1 - 输出重定向到日志文件
 # & - 后台运行
-# nohup python3 benchmark/gsm8k/bench_sglang.py --host http://localhost --port 8418 --num-questions 100 > gsm8k_bench.log 2>&1 &
 

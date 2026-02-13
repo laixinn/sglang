@@ -79,6 +79,7 @@ from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_dp_dtype,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -1473,6 +1474,48 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.weight_block_size = (
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                 )
+       # init USC Attention Cache
+        from sglang.srt.layers.attention.usc.attn_cache import USCSparseAttnCache
+        nsa_index_topk = get_nsa_index_topk(config) if self.use_nsa else 2048
+        self.usc_attn_cache = USCSparseAttnCache(
+            hidden_size=hidden_size,
+            n_heads=num_heads,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            topk=nsa_index_topk,
+            prefix=add_prefix("usc_attn_estimator", prefix),
+            quant_config=quant_config,
+            enable_estimator=False,  
+        )
+        if self.nsa_enable_prefill_cp and hasattr(self, 'cp_size'):
+            self.usc_attn_cache.set_cp_info(
+                cp_size=self.cp_size,
+                cp_rank=get_attention_tp_rank(),
+                use_cp=True
+            )
+
+        self._usc_attn_ctx = {
+            "AttnForwardMethod": AttnForwardMethod,
+            "per_token_group_quant_mla_deep_gemm_masked_fp8": per_token_group_quant_mla_deep_gemm_masked_fp8,
+            "per_tensor_quant_mla_fp8": per_tensor_quant_mla_fp8,
+            "bmm_fp8": globals().get("bmm_fp8"),
+            "deep_gemm_wrapper": deep_gemm_wrapper,
+            "fp8_dtype": globals().get("fp8_dtype"),
+            "fused_qk_rope_cat_and_cache_mla": globals().get("fused_qk_rope_cat_and_cache_mla"),
+            "is_in_piecewise_cuda_graph": is_in_piecewise_cuda_graph,
+            "_is_cublas_ge_129": _is_cublas_ge_129,
+            "_is_hip": _is_hip,
+            "_use_aiter_gfx95": _use_aiter_gfx95,
+            "_use_aiter": _use_aiter,
+            "_is_gfx95_supported": _is_gfx95_supported,
+            "fused_rms_mxfp4_quant": globals().get("fused_rms_mxfp4_quant"),
+            "fused_rms_fp8_group_quant": globals().get("fused_rms_fp8_group_quant"),
+            "batched_gemm_afp4wfp4_pre_quant": globals().get("batched_gemm_afp4wfp4_pre_quant"),
+            "batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant": globals().get(
+                "batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant"
+            ),
+            "FORWARD_ABSORB_CORE_ATTENTION_BACKENDS": FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
+        }
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
@@ -1508,6 +1551,100 @@ class DeepseekV2AttentionMLA(nn.Module):
         state.hidden_states_after_attn = self.forward_core(
             state.pop("attn_intermediate_state")
         )
+
+    # ===================== USC Attention Operations =====================
+    def op_usc_prepare(self, state):
+        self.usc_attn_cache.usc_prepare_qkv(state, self)
+
+    def op_usc_hit_a(self, state):
+        q_all = state.get("_usc_q_all")
+        kv_pool = state.get("_usc_kv_pool")
+        sm_scale = state.get("_usc_sm_scale")
+        predicted_indices = state._data.pop("attn_estimated_sparse_index", None)
+
+        if q_all is None or kv_pool is None or predicted_indices is None:
+            state.attn_predicted_qk = None
+            state._usc_predicted_indices = None
+            return
+
+        state.attn_predicted_qk = (
+            self.usc_attn_cache.compute_qk_scores_pytorch(
+                q_all, predicted_indices, sm_scale, kv_pool,
+            )
+        )
+        state._usc_predicted_indices = predicted_indices
+
+    def op_usc_topk(self, state):
+        """Compute actual sparse index via the NSA indexer."""
+        self.usc_attn_cache.usc_prepare_topk(state, self)
+
+    def op_usc_verify(self, state):
+        """Compare predicted vs actual sparse index → hit_mask, miss_mask."""
+        predicted_indices = state.get("_usc_predicted_indices")
+        actual_sparse_index = state.get("attn_actual_sparse_index")
+
+        state.attn_hit_mask, state.attn_miss_mask = (
+            self.usc_attn_cache.verify_cache_v2(
+                actual_sparse_index, predicted_indices,
+            )
+        )
+
+    def op_usc_miss_reduce(self, state):
+        """
+        1. Compute miss QK scores 
+        2. Map hit QK scores from predicted positions to actual positions
+        3. Merge, softmax, PV multiply, w_vc absorption, o_proj
+        """
+        q_all = state.pop("_usc_q_all")
+        kv_pool = state.pop("_usc_kv_pool")
+        sm_scale = state.pop("_usc_sm_scale")
+        actual_indices = state.get("attn_actual_sparse_index")  # kept for estimate_a
+        hit_mask = state.pop("attn_hit_mask")
+        miss_mask = state.pop("attn_miss_mask")
+        predicted_qk = state.pop("attn_predicted_qk")
+        predicted_indices = state.pop("_usc_predicted_indices")
+        intermediate_state = state.pop("usc_attn_intermediate")
+
+        if q_all is not None and kv_pool is not None and actual_indices is not None:
+            output = self.usc_attn_cache.compute_miss_reduce(
+                attn_module=self,
+                q_all=q_all,
+                actual_indices=actual_indices,
+                hit_mask=hit_mask,
+                miss_mask=miss_mask,
+                predicted_qk=predicted_qk,
+                predicted_indices=predicted_indices,
+                sm_scale=sm_scale,
+                zero_allocator=state.zero_allocator,
+                kv_pool=kv_pool,
+            )
+            if output is not None and output.dim() == 3:
+                output = self.usc_attn_cache.apply_o_proj(output, self.o_proj)
+        elif intermediate_state is not None:
+            output = self.forward_core(intermediate_state)
+        else:
+            raise RuntimeError(
+                "USC Attention miss_reduce: q_all/kv_pool/actual_indices "
+                "are None and no intermediate_state available"
+            )
+
+        state.hidden_states_after_attn = output
+
+    def op_usc_estimate_a(self, state):
+        """predict next layer's sparse index
+        use current layer's topk_indices as next layer's prediction
+        """
+        actual_sparse_index = state._data.pop("attn_actual_sparse_index", None)
+
+        if actual_sparse_index is not None:
+            state.attn_estimate_event = actual_sparse_index
+
+    def op_usc_estimate_b(self, state):
+        estimate_event = state._data.pop("attn_estimate_event", None)
+        if estimate_event is not None:
+            state.attn_estimated_sparse_index = self.usc_attn_cache.index_estimate_b(estimate_event)
+        else:
+            state.attn_estimated_sparse_index = None
 
     def forward(
         self,
@@ -3029,10 +3166,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         return output
 
     def op_usc_comm_prepare_mlp(self, state):
+        hidden_states_after_attn = state.pop("hidden_states_after_attn")
+        residual_after_input_ln = state.pop("residual_after_input_ln")
+        # Ensure dtype matches the DP gather buffer (model_config.dtype) to avoid
+        # "output tensor must have the same type as input tensor" in all_gather.
+        target_dtype = get_dp_dtype()
+        if hidden_states_after_attn.dtype != target_dtype:
+            hidden_states_after_attn = hidden_states_after_attn.to(target_dtype)
+        if residual_after_input_ln is not None and residual_after_input_ln.dtype != target_dtype:
+            residual_after_input_ln = residual_after_input_ln.to(target_dtype)
         state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
             self.layer_communicator.prepare_mlp(
-                state.pop("hidden_states_after_attn"),
-                state.pop("residual_after_input_ln"),
+                hidden_states_after_attn,
+                residual_after_input_ln,
                 state.forward_batch,
             )
         )
@@ -3056,6 +3202,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         tbo_subbatch_index: Optional[int] = None,
         estimate_event: Optional[StandardTopKOutput] = None,
+        attn_estimate_event=None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
@@ -3067,6 +3214,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
                 tbo_subbatch_index=tbo_subbatch_index,
                 estimate_event=estimate_event,
+                attn_estimate_event=attn_estimate_event,
             )
         )
 
@@ -3085,6 +3233,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=state.zero_allocator,
             tbo_subbatch_index=state.tbo_subbatch_index,
             estimate_event=state.estimate_event,
+            attn_estimate_event=state.attn_estimate_event,
         )
 
         state.clear(
@@ -3094,6 +3243,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 "zero_allocator",
                 "tbo_subbatch_index",
                 "estimate_event",
+                "attn_estimate_event",  
             }
         )
         return output
@@ -3306,7 +3456,8 @@ class DeepseekV2Model(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo or (is_usc_enabled() and forward_batch.forward_mode.is_decode()):
+        # if forward_batch.can_run_tbo or (is_usc_enabled() and forward_batch.forward_mode.is_decode()):
+        if forward_batch.can_run_tbo or is_usc_enabled():
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer

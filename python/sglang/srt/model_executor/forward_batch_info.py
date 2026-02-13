@@ -1339,4 +1339,4 @@ class USCStatBuffers:
                 f"[decode step {step}] USC hit rate: {hit / total * 100:.2f}% "
                 f"({hit}/{total})",
                 flush=True,
-            )
+        )

@@ -53,9 +53,12 @@ __global__ void moe_usc_hit_replace_kernel(
   // avoid accessing out of bounds
   if (row_id >= num_tokens) return;
 
+  const int total_elems = num_tokens * topk;
 #pragma unroll
-  for (int base = 0; base < num_tokens * topk; base += stride){
+  for (int base = 0; base < total_elems; base += stride){
     int offset = base + row_id * topk;
+    // Bounds check: skip this chunk if the thread's row exceeds num_tokens
+    if (offset + topk - 1 >= total_elems) break;
     int producer_idx = 0;
     int consumer_idx = 0;
 

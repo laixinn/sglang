@@ -153,3 +153,40 @@ def flash_mla_sparse_fwd(
         q, kv, indices, sm_scale, d_v
     )
     return results
+
+
+def flash_mla_sparse_merge_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    actual_indices: torch.Tensor,
+    predicted_qk: torch.Tensor,
+    hit_mask: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sparse attention with QK merge for hit positions.
+
+    For hit positions (hit_mask=1), uses pre-computed predicted_qk scores
+    instead of recomputing QK GEMM.  For miss positions, computes QK^T via GEMM.
+    Then performs online softmax + PV → output.
+
+    Args:
+        q: [s_q, h_q, d_qk], bfloat16
+        kv: [s_kv, h_kv, d_qk], bfloat16  (h_kv=1 for MLA)
+        actual_indices: [s_q, h_kv, topk], int32
+        predicted_qk: [s_q, h_q, topk], float32  (= raw_QK * sm_scale, remapped)
+        hit_mask: [s_q, h_kv, topk], int32  (1=hit, 0=miss)
+        sm_scale: float
+        d_v: int = 512
+
+    Returns:
+        (output, max_logits, lse)
+        - output: [s_q, h_q, d_v], bfloat16
+        - max_logits: [s_q, h_q], float
+        - lse: [s_q, h_q], float, 2-based log-sum-exp
+    """
+    results = torch.ops.sgl_kernel.sparse_merge_prefill_fwd.default(
+        q, kv, actual_indices, predicted_qk, hit_mask, sm_scale, d_v
+    )
+    return results

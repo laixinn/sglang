@@ -45,6 +45,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v) -> Tensor[]");
   m.impl("sparse_prefill_fwd", torch::kCUDA, &sparse_prefill_fwd);
 
+  m.def("sparse_merge_prefill_fwd(Tensor q, Tensor kv, Tensor indices, Tensor predicted_qk, Tensor hit_mask, float sm_scale, int d_v) -> Tensor[]");
+  m.impl("sparse_merge_prefill_fwd", torch::kCUDA, &sparse_merge_prefill_fwd);
+
   m.def(
       "fwd_kvcache_mla_fp8(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "
       "softmax_scale, bool is_causal, Tensor tile_scheduler_metadata, Tensor num_splits, Tensor? descale_q, Tensor? "

@@ -48,6 +48,10 @@ set(FlashMLA_SOURCES
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/dense_fp8_python_api.cpp
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu
+
+    # Sparse merge prefill kernel (self-contained in sgl-kernel)
+    "csrc/flashmla/sparse_merge_api.cpp"
+    "csrc/flashmla/sparse_merge_fwd.cu"
 )
 
 Python_add_library(flashmla_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${FlashMLA_SOURCES})
@@ -58,6 +62,7 @@ target_include_directories(flashmla_ops PRIVATE
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/tools/util/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/flashmla
 )
 
 target_link_libraries(flashmla_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
