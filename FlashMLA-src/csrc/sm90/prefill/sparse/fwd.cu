@@ -815,8 +815,8 @@ sparse_attn_merge_fwd_kernel(__grid_constant__ const SparseMergePrefillParams pa
         };
 
         // Merge hit positions: replace rP with pre-computed predicted_qk scores.
-        // predicted_qk stores (raw_QK * sm_scale); rP holds raw_QK.
-        // Convert: rP = predicted_qk * inv_sm_scale.
+        // predicted_qk stores (raw_QK); rP holds raw_QK.
+        // Convert: rP = predicted_qk.
         auto merge_hit_qk = [&](auto warpgroup_idx, int topk_base) {
             constexpr bool IS_WG1 = std::is_same_v<decltype(warpgroup_idx), Warpgroup1>;
             float* gPredQK = params.predicted_qk +
@@ -831,17 +831,17 @@ sparse_attn_merge_fwd_kernel(__grid_constant__ const SparseMergePrefillParams pa
                 for (int i = row_idx*2; i < size(rP); i += 4) {
                     int col = 8*(i/4) + (idx_in_warpgroup%4)*2;
                     if (plan.is_hit[IS_WG1][col] && plan.is_kv_valid[IS_WG1][col]) {
-                        rP(i) = __ldg(gPredQK + row * params.stride_predicted_qk_h_q + col) * params.inv_sm_scale;
+                        rP(i) = __ldg(gPredQK + row * params.stride_predicted_qk_h_q + col);
                     }
                     if (plan.is_hit[IS_WG1][col+1] && plan.is_kv_valid[IS_WG1][col+1]) {
-                        rP(i+1) = __ldg(gPredQK + row * params.stride_predicted_qk_h_q + col + 1) * params.inv_sm_scale;
+                        rP(i+1) = __ldg(gPredQK + row * params.stride_predicted_qk_h_q + col + 1);
                     }
                 }
             }
         };
 
         // Load predicted_qk for ALL positions in a hit-only block (skip QK GEMM).
-        // predicted_qk stores (raw_QK * sm_scale); rP holds raw_QK.
+        // predicted_qk stores (raw_QK); rP holds raw_QK.
         // mask_rP (called after this) will set invalid positions to -INFINITY.
         auto load_all_predicted_qk = [&](auto warpgroup_idx, int topk_base) {
             constexpr bool IS_WG1 = std::is_same_v<decltype(warpgroup_idx), Warpgroup1>;
@@ -856,8 +856,8 @@ sparse_attn_merge_fwd_kernel(__grid_constant__ const SparseMergePrefillParams pa
                 CUTE_UNROLL
                 for (int i = row_idx*2; i < size(rP); i += 4) {
                     int col = 8*(i/4) + (idx_in_warpgroup%4)*2;
-                    rP(i)   = __ldg(gPredQK + row * params.stride_predicted_qk_h_q + col)     * params.inv_sm_scale;
-                    rP(i+1) = __ldg(gPredQK + row * params.stride_predicted_qk_h_q + col + 1) * params.inv_sm_scale;
+                    rP(i)   = __ldg(gPredQK + row * params.stride_predicted_qk_h_q + col);
+                    rP(i+1) = __ldg(gPredQK + row * params.stride_predicted_qk_h_q + col + 1);
                 }
             }
         };

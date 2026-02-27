@@ -565,7 +565,7 @@ class USCSparseAttnCache:
         qk = torch.bmm(
             q_all.float().contiguous(),
             selected_k.float().transpose(1, 2).contiguous(),
-        ) * sm_scale
+        ) 
         _debug_sync("compute_qk_scores_pytorch:bmm_qk")
 
         # Mask invalid → -inf
@@ -729,20 +729,17 @@ class USCSparseAttnCache:
             _HAS_SPARSE_MERGE_KERNEL
             and q_all.dtype == torch.bfloat16
         ):
-            try:
-                # logger.info("Using cuda kernel sparse merge kernel")
-                return self._compute_miss_reduce_kernel(
-                    attn_module, q_all, actual_indices, hit_mask, miss_mask,
-                    predicted_qk, predicted_indices, sm_scale, zero_allocator, kv_pool,
-                )
-            except Exception as e:
-                logger.warning(
-                    "sparse_merge kernel failed, falling back to PyTorch: %s", e
-                )
-        return self._compute_miss_reduce_pytorch(
-            attn_module, q_all, actual_indices, hit_mask, miss_mask,
-            predicted_qk, predicted_indices, sm_scale, zero_allocator, kv_pool,
-        )
+            # logger.info(">>> dispatch to _compute_miss_reduce_kernel  s_q=%d h_q=%d", q_all.shape[0], q_all.shape[1])
+            return self._compute_miss_reduce_kernel(
+                attn_module, q_all, actual_indices, hit_mask, miss_mask,
+                predicted_qk, predicted_indices, sm_scale, zero_allocator, kv_pool,
+            )
+        else:
+            logger.info(">>> fallback: _HAS_SPARSE_MERGE_KERNEL=%s dtype=%s", _HAS_SPARSE_MERGE_KERNEL, q_all.dtype)
+            return self._compute_miss_reduce_pytorch(
+                attn_module, q_all, actual_indices, hit_mask, miss_mask,
+                predicted_qk, predicted_indices, sm_scale, zero_allocator, kv_pool,
+            )
 
     def _compute_miss_reduce_kernel(
         self,
@@ -846,8 +843,6 @@ class USCSparseAttnCache:
             sm_scale=sm_scale,
             d_v=kv_lora_rank,
         )
-        # logger.info(f"output shape: {output.shape}")
-        # output: [s_q, h_q+pad_h, kv_lora_rank], bf16
 
         # Slice back to original h_q
         if pad_h > 0:
@@ -857,7 +852,7 @@ class USCSparseAttnCache:
         return self._apply_wvc_absorption(attn_module, output, zero_allocator)
 
     # ------------------------------------------------------------------ #
-    #  PyTorch fallback path                                              #
+    #  PyTorch fallback path                                             #
     # ------------------------------------------------------------------ #
     def _compute_miss_reduce_pytorch(
         self,
@@ -916,7 +911,7 @@ class USCSparseAttnCache:
                     miss_qk = torch.bmm(
                         q_all.float().contiguous(),
                         miss_k.float().transpose(1, 2).contiguous(),
-                    ) * sm_scale
+                    ) 
                     _debug_sync("miss_reduce:bmm_miss_qk")
                     miss_qk.masked_fill_(
                         ~compact_valid.unsqueeze(1).expand(-1, h_q, -1),
@@ -929,7 +924,7 @@ class USCSparseAttnCache:
                 qk_all = torch.bmm(
                     q_all.float().contiguous(),
                     all_k.float().transpose(1, 2).contiguous(),
-                ) * sm_scale
+                ) 
                 qk_all.masked_fill_(~valid_mask.unsqueeze(1), float('-inf'))
                 full_qk = qk_all
 
@@ -942,6 +937,7 @@ class USCSparseAttnCache:
             hit_exp = hit_mask.unsqueeze(1).expand(-1, h_q, -1)
             full_qk[hit_exp] = remapped_qk[hit_exp]
 
+        full_qk = full_qk * sm_scale
         full_qk.masked_fill_(~valid_mask.unsqueeze(1), float('-inf'))
 
         # Step 3: Softmax
