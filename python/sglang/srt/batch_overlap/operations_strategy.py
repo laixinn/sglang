@@ -179,31 +179,17 @@ def _compute_attn_usc_prefill(layer):
         tbo_delta_stages=0,
         operations=[
             layer.op_usc_comm_prepare_attn,
-            layer.self_attn.op_usc_estimate_b,  
+            layer.self_attn.op_usc_estimate_b, 
+            layer.self_attn.op_usc_hit_a,        
             layer.self_attn.op_usc_prepare,    
-            layer.self_attn.op_usc_hit_a,       
             layer.self_attn.op_usc_topk,        
             layer.self_attn.op_usc_verify,     
+            layer.self_attn.op_usc_hit_b,       
             layer.self_attn.op_usc_miss_reduce,     
             layer.self_attn.op_usc_estimate_a, 
-            layer.op_usc_comm_prepare_mlp,
+            layer.op_comm_prepare_mlp,
             
-            layer.mlp.op_usc_estimate_b, # estimated topk is ready
-
-            layer.mlp.op_usc_hit_a,  # overlap hit forward with op_gate+op_select_experts
-
-            layer.mlp.op_usc_topk,
-            
-            layer.mlp.op_usc_verify, # sync: use true and estimated topk
-
-            layer.mlp.op_usc_miss,   # get partial true topk results and shared experts
-            
-            layer.mlp.op_usc_hit_b,  # get full estimated topk results
-            layer.mlp.op_usc_reduce, # sync: take partial hit results, combine and then reduce
-
-            layer.mlp.op_usc_estimate_a, # launch topk estimation, old results have been cleaned
-            layer.mlp.op_usc_output,
-
+            layer.mlp.op_usc_normal,
             layer.op_usc_comm_postprocess_layer,
         ],
     )

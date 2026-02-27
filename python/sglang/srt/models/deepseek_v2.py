@@ -1074,6 +1074,15 @@ class DeepseekV2MoE(nn.Module):
 
         state.hidden_states_mlp_output = final_hidden_states
 
+
+    def op_usc_normal(self, state):
+        state.hidden_states_mlp_output = self.forward(
+            state.pop("hidden_states_mlp_input"),
+            state.forward_batch,
+            
+        )
+
+
     def op_usc_estimate_a(self, state):
         if self.has_usc_estimation:
             state.estimate_event = self.usc_cache.index_estimate_a(
@@ -1573,6 +1582,12 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         )
         state._usc_predicted_indices = predicted_indices
+
+    def op_usc_hit_b(self, state):
+        attn_predicted_qk = state.pop("attn_predicted_qk")
+        if attn_predicted_qk is not None:
+            attn_predicted_qk = attn_predicted_qk.get_tensor()
+        state.attn_predicted_qk = attn_predicted_qk
 
     def op_usc_topk(self, state):
         """Compute actual sparse index via the NSA indexer."""
@@ -3457,7 +3472,7 @@ class DeepseekV2Model(nn.Module):
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
         # if forward_batch.can_run_tbo or (is_usc_enabled() and forward_batch.forward_mode.is_decode()):
-        if forward_batch.can_run_tbo or is_usc_enabled():
+        if forward_batch.can_run_tbo or (is_usc_enabled() and forward_batch.forward_mode.is_prefill()):
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer

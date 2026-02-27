@@ -40,6 +40,14 @@ def _debug_sync(tag: str):
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+class StreamTensorWrapper:
+    def __init__(self, tensor: torch.Tensor, event: torch.cuda.Event):
+        self.tensor = tensor
+        self.event = event
+
+    def get_tensor(self):
+        self.event.wait()
+        return self.tensor
 
 class USCSparseAttnCache:    
     def __init__(
@@ -61,6 +69,8 @@ class USCSparseAttnCache:
         
         # Async stream for hit attention
         self.alt_stream = torch.cuda.Stream()
+        self.alt_event0 = torch.cuda.Event()
+        self.alt_event1 = torch.cuda.Event()
         
         # CP info
         self.cp_size = 1
@@ -72,6 +82,17 @@ class USCSparseAttnCache:
         self.estimator = None
         self._estimate_event = None
         self._estimated_index = None
+
+    def _async_execute(self, fn: Callable):
+        self.alt_event0.record()
+        with torch.cuda.stream(self.alt_stream):
+            self.alt_event0.wait()
+            result = fn()
+            self.alt_event1.record()
+        return StreamTensorWrapper(
+            result,
+            self.alt_event1
+        )
 
     def set_cp_info(self, cp_size: int, cp_rank: int, use_cp: bool = True):
         self.cp_size = cp_size
@@ -540,45 +561,48 @@ class USCSparseAttnCache:
         sm_scale: float,
         kv_pool: torch.Tensor,    # [pool_size, 1, d_qk]
     ) -> torch.Tensor:
-        """Compute Q@K^T scores for given indices.
+        def _fn():
+            """Compute Q@K^T scores for given indices.
 
-        Called from op_usc_hit_a with predicted_indices.
+            Called from op_usc_hit_a with predicted_indices.
 
-        Returns:
-            qk_scores: [s_q, h_q, topk], float32, invalid positions = -inf
-        """
-        s_q, h_q, _ = q_all.shape
-        topk = indices.shape[-1]
-        device = q_all.device
+            Returns:
+                qk_scores: [s_q, h_q, topk], float32, invalid positions = -inf
+            """
+            s_q, h_q, _ = q_all.shape
+            topk = indices.shape[-1]
+            device = q_all.device
 
-        safe_idx, valid_mask, K = self._resolve_kv_and_trim(indices, kv_pool)
+            safe_idx, valid_mask, K = self._resolve_kv_and_trim(indices, kv_pool)
 
-        if K == 0 or not valid_mask.any():
-            return torch.full((s_q, h_q, topk), float('-inf'),
-                              dtype=torch.float32, device=device)
+            if K == 0 or not valid_mask.any():
+                return torch.full((s_q, h_q, topk), float('-inf'),
+                                dtype=torch.float32, device=device)
 
-        # Gather K: [s_q, K, d_qk]
-        selected_k = kv_pool[safe_idx, 0, :]
-        _debug_sync("compute_qk_scores_pytorch:gather_k")
+            # Gather K: [s_q, K, d_qk]
+            selected_k = kv_pool[safe_idx, 0, :]
+            _debug_sync("compute_qk_scores_pytorch:gather_k")
 
-        # Q @ K^T: [s_q, h_q, K]
-        qk = torch.bmm(
-            q_all.float().contiguous(),
-            selected_k.float().transpose(1, 2).contiguous(),
-        ) 
-        _debug_sync("compute_qk_scores_pytorch:bmm_qk")
+            # Q @ K^T: [s_q, h_q, K]
+            qk = torch.bmm(
+                q_all.float().contiguous(),
+                selected_k.float().transpose(1, 2).contiguous(),
+            ) 
+            _debug_sync("compute_qk_scores_pytorch:bmm_qk")
 
-        # Mask invalid → -inf
-        qk.masked_fill_(~valid_mask.unsqueeze(1), float('-inf'))
+            # Mask invalid → -inf
+            qk.masked_fill_(~valid_mask.unsqueeze(1), float('-inf'))
 
-        if K == topk:
-            return qk
+            if K == topk:
+                return qk
 
-        # Pad back to original topk dimension
-        out = torch.full((s_q, h_q, topk), float('-inf'),
-                         dtype=torch.float32, device=device)
-        out[:, :, :K] = qk
-        return out
+            # Pad back to original topk dimension
+            out = torch.full((s_q, h_q, topk), float('-inf'),
+                            dtype=torch.float32, device=device)
+            out[:, :, :K] = qk
+            return out
+
+        return self._async_execute(_fn)
 
     def verify_cache_v2(
         self,
