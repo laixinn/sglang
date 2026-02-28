@@ -1079,7 +1079,8 @@ class DeepseekV2MoE(nn.Module):
         state.hidden_states_mlp_output = self.forward(
             state.pop("hidden_states_mlp_input"),
             state.forward_batch,
-            
+            state.pop("should_allreduce_fusion"),
+            state.pop("use_reduce_scatter"),
         )
 
 
@@ -3205,7 +3206,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         state.use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             state.forward_batch
         )
-        state.hidden_states_for_estimate = state.hidden_states_mlp_input.clone()
+        # fused moe is inplace
+        # state.hidden_states_for_estimate = state.hidden_states_mlp_input.clone()
 
     def op_usc_comm_prepare_attn(
         self,
