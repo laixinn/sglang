@@ -27,8 +27,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe import MoeRunner
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
     from sglang.srt.layers.moe.token_dispatcher.standard import IntermediateDispatchOutput
+    from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
 
 
 @contextmanager
@@ -399,7 +399,8 @@ class USCEPMoECache(DecodeCache):
             self.alt_event1.record()
         return StreamTensorWrapper(
             result,
-            self.alt_event1
+            self.alt_event1,
+            sync=True,
         )
 
     def index_estimate_a(
@@ -445,11 +446,9 @@ class USCEPMoECache(DecodeCache):
 
     def hit_combine_a(
         self,
-        hit_varlen_combine_output: torch.Tensor,
-        miss_varlen_combine_output: torch.Tensor,
+        hit_varlen_combine_output: CombineInput,
         hit_mask: torch.Tensor,
         miss_mask: torch.Tensor,
-        routed_scaling_factor: float,
         estimated_topk: TopKOutput,
         grounded_topk: TopKOutput,
     ):
@@ -457,18 +456,16 @@ class USCEPMoECache(DecodeCache):
         moe_usc_hit_replace(
             grounded_topk.topk_weights, 
             miss_mask, 
-            estimated_topk.topk_weights, 
+            hit_varlen_combine_output.topk_weights, 
             hit_mask,
             inplace=True
         )
-        hit_varlen_combine_output *= estimated_topk.topk_weights.unsqueeze(2)
-
         # get hit results, no need to apply miss mask
-        hit_varlen_combine_output.masked_fill_(~hit_mask.unsqueeze(2), 0)
+        hit_varlen_combine_output.topk_ids.masked_fill_(~hit_mask, -1)
 
         # pack combine input
         self.experts.dispatcher.combine_a(
-            hidden_states=hit_varlen_combine_output,
+            combine_input=hit_varlen_combine_output,
             tbo_subbatch_index=self.hit_tbo_index,
         )
 
@@ -506,11 +503,11 @@ class USCEPMoECache(DecodeCache):
         miss_varlen_expert_output,
     ):
         self.experts.dispatcher.combine_a(
-            hidden_states=miss_varlen_expert_output,
+            combine_input=miss_varlen_expert_output,
             tbo_subbatch_index=self.miss_tbo_index,
         )
 
-    def miss_combine_b(self, hit_varlen_combine_output: torch.Tensor):
+    def miss_combine_b(self):
         return self.experts.dispatcher.combine_b(
             tbo_subbatch_index=self.miss_tbo_index,
         )
@@ -521,78 +518,31 @@ class USCEPMoECache(DecodeCache):
         topk_output: TopKOutput,
         cache_topk_output: Optional[TopKOutput] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.dispatch_result is not None:
-            # expert-centric
-            cache_shuffle_idx = self.dispatch_result[6]
-            cache_masked_m = self.dispatch_result[3]
+        topk_idx = topk_output.topk_ids
 
-            # TODO: optimize this
-            # max_m = cache_masked_m.max()
-            max_m = topk_idx.shape[0] * self.world_size
+        if cache_topk_output is not None:
+            cache_topk_idx = cache_topk_output.topk_ids
 
-            topk_m = torch.full((topk_idx.shape[0],), topk_idx.shape[1], device=topk_idx.device, dtype=topk_idx.dtype)
-            # TODO: optimize this, do shuffle when topk calculation
-            shuffle_index, masked_m = self._shuffle_topk_idx(topk_idx, max_m, topk_m)
-
-            hit_expert_mask = torch.zeros_like(cache_shuffle_idx, dtype=torch.bool)
-            miss_expert_mask = torch.zeros_like(shuffle_index, dtype=torch.bool)
-
-            for i in range(self.num_local_experts):
-                # apply on cache shuffle_idx
-                hit_expert_mask[i, :cache_masked_m[i]] = torch.isin(cache_shuffle_idx[i, :cache_masked_m[i]], shuffle_index[i, :masked_m[i]], assume_unique=True)
-                # apply on new index
-                miss_expert_mask[i, :masked_m[i]] = torch.isin(shuffle_index[i, :masked_m[i]], cache_shuffle_idx[i, :cache_masked_m[i]], assume_unique=True, invert=True)
-
-            # token-centric
-            cache_topk_idx = self.dispatch_result[1]
-
-            hit_token_mask = torch.zeros_like(topk_idx, dtype=torch.bool)
-            miss_token_mask = torch.zeros_like(topk_idx, dtype=torch.bool)
-
-            M = cache_topk_idx.shape[0]
-            for i in range(M):
-                # apply on cache topk_idx
-                hit_token_mask[i, :] = torch.isin(cache_topk_idx[i, :], topk_idx[i, :], assume_unique=True)
-                # apply on new index
-                miss_token_mask[i, :] = torch.isin(topk_idx[i, :], cache_topk_idx[i, :], assume_unique=True, invert=True)
+            hit_token_mask, miss_token_mask = verify_cache_mask_triton(cache_topk_idx, topk_idx)
         else:
-            hit_expert_mask = torch.zeros((self.num_experts, topk_idx.shape[0] * self.world_size), dtype=torch.bool, device='cuda')
-            miss_expert_mask = torch.ones((self.num_local_experts, topk_idx.shape[0] * self.world_size), dtype=torch.bool, device='cuda')
-            hit_token_mask = torch.zeros_like(topk_idx, dtype=torch.bool, device='cuda')
-            miss_token_mask = torch.ones_like(topk_idx, dtype=torch.bool, device='cuda')
+            hit_token_mask = torch.zeros_like(topk_idx, dtype=torch.bool)
+            miss_token_mask = torch.ones_like(topk_idx, dtype=torch.bool)
 
-        return (hit_expert_mask, hit_token_mask), (miss_expert_mask, miss_token_mask)
+        return hit_token_mask, miss_token_mask
 
-    def _shuffle_topk_idx(self, topk_idx: torch.Tensor, max_m: int, topk_m: torch.Tensor):
-        '''
-        Shuffle the topk_idx [num_experts, num_topk] to [num_experts, num_tokens]
-        '''
+    def _get_miss_cache(self, topk_output: TopKOutput, miss_mask: torch.Tensor):
+        # ensure topk_idx is no longer used outside
+        miss_topk_idx = topk_output.topk_ids
+        # miss_topk_weights = topk_output.topk_weights
+        # miss_router_logits = topk_output.router_logits
 
-        assert topk_m is not None
+        miss_topk_idx.masked_fill_(~miss_mask, -1)
+        # miss_topk_weights.masked_fill_(~miss_mask, 0.0)
+        # miss_router_logits.masked_fill_(~miss_mask, 0.0)
 
-        # gather topk_idx
-        num_tokens = topk_idx.shape[0]
-        num_topk = topk_idx.shape[1]
-        total_tokens = self.world_size * num_tokens
-        all_topk_idx = torch.empty((self.world_size, num_tokens, num_topk), dtype=topk_idx.dtype, device='cuda')
-        dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=self.device_group)
-        all_topk_idx = all_topk_idx.view(total_tokens, num_topk)
-
-        # gather topk_m
-        all_topk_m = torch.empty((self.world_size, num_tokens), dtype=topk_m.dtype, device='cuda')
-        dist.all_gather_into_tensor(all_topk_m, topk_m, group=self.device_group)
-        all_topk_m = all_topk_m.view(total_tokens)
-
-        shuffle_idx = torch.full((self.num_local_experts, max_m), -1, device=topk_idx.device, dtype=topk_idx.dtype)
-        masked_m = torch.zeros(self.num_local_experts, device=topk_idx.device, dtype=torch.int32)
-
-        for i in range(self.num_local_experts):
-            expert_id = i + self.rank * self.num_local_experts
-            for j in range(total_tokens):
-                _m = min(all_topk_m[j], topk_idx.shape[1])
-                cnt = (all_topk_idx[j, :_m] == expert_id).any()
-                if cnt > 0:
-                    shuffle_idx[i, masked_m[i]] = j
-                    masked_m[i] += 1
-
-        return shuffle_idx, masked_m
+        # hit mask is separated
+        return StandardTopKOutput(
+            topk_weights=topk_output.topk_weights,
+            topk_ids=miss_topk_idx,
+            router_logits=topk_output.router_logits,
+        )

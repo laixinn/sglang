@@ -162,8 +162,12 @@ def _compute_moe_usc_layer_operations_strategy_tbo(
     elif (
         forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
     ):
+        from sglang.srt.layers.moe import get_moe_a2a_backend
         # TODO: with attn, this prefill strategy might not be applicable to decode
-        return _compute_moe_usc_decode(layer)
+        if get_moe_a2a_backend().is_deepep():
+            return _compute_ep_moe_usc_decode(layer)
+        else:
+            return _compute_moe_usc_decode(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
 
@@ -217,33 +221,35 @@ def _compute_ep_moe_usc_decode(layer):
             layer.self_attn.op_core,
             layer.op_usc_comm_prepare_mlp,
             
-            layer.mlp.op_usc_estimate_b, # estimated topk is ready
+            # layer.mlp.op_usc_estimate_b, # estimated topk is ready
 
-            # hit: dispatch | miss: topk + verify
-            layer.mlp.op_usc_ep_hit_dispatch_a,
-            layer.mlp.op_usc_topk,
-            layer.mlp.op_usc_ep_verify,
+            # # hit: dispatch | miss: topk + verify
+            # layer.mlp.op_usc_ep_hit_dispatch_a,
+            # layer.mlp.op_usc_topk,
+            # layer.mlp.op_usc_verify,
 
-            # hit: MoE calculation | miss: dispatch
-            layer.mlp.op_usc_ep_miss_dispatch_a,
-            layer.mlp.op_usc_ep_hit_dispatch_b,
-            layer.mlp.op_usc_ep_hit_expert_a,
+            # # hit: MoE calculation | miss: dispatch
+            # layer.mlp.op_usc_ep_miss_dispatch_a,
+            # layer.mlp.op_usc_ep_hit_dispatch_b,
+            # layer.mlp.op_usc_ep_hit_expert_a,
             
-            # hit: combine | miss: MoE calculation
-            layer.mlp.op_usc_ep_hit_expert_b,
-            layer.mlp.op_usc_hit_combine_a,
-            layer.mlp.op_usc_ep_miss_dispatch_b,
-            layer.mlp.op_usc_ep_miss_expert_a,
+            # # hit: combine | miss: MoE calculation
+            # layer.mlp.op_usc_ep_hit_expert_b,
+            # layer.mlp.op_usc_ep_hit_combine_a,
+            # layer.mlp.op_usc_ep_miss_dispatch_b,
+            # layer.mlp.op_usc_ep_miss_expert_a,
 
-            # hit: next topk | miss: combine
-            layer.mlp.op_usc_ep_hit_combine_b,
-            layer.mlp.op_usc_ep_miss_expert_b,
-            layer.mlp.op_usc_ep_miss_combine_a,
-            layer.mlp.op_usc_estimate_a,
+            # # hit: next topk | miss: combine
+            # layer.mlp.op_usc_ep_hit_combine_b,
+            # layer.mlp.op_usc_ep_miss_expert_b,
+            # layer.mlp.op_usc_ep_miss_combine_a,
+            # layer.mlp.op_usc_estimate_a,
 
-            # reduce hit and miss results
-            layer.mlp.op_usc_ep_miss_combine_b,
-            layer.mlp.op_usc_output,
+            # # reduce hit and miss results
+            # layer.mlp.op_usc_ep_miss_combine_b,
+            # layer.mlp.op_usc_output,
+
+            layer.mlp.op_usc_ep_forward,
 
             layer.op_usc_comm_postprocess_layer,
         ],

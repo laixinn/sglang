@@ -596,7 +596,7 @@ class DeepseekV2MoE(nn.Module):
 
         if is_usc_enabled():
             if get_moe_a2a_backend().is_deepep():
-                self.usc_cache = USCEPMoECache()
+                self.usc_cache = USCEPMoECache(self.experts)
             else:
                 self.usc_cache = USCTPMoECache(self.experts)
 
@@ -1172,13 +1172,36 @@ class DeepseekV2MoE(nn.Module):
         return estimated_topk
 
     # EP operations
-    # reused operations: op_usc_estimate_a, op_usc_estimate_b, op_usc_topk, usc_index_estimate
-    def op_usc_ep_verify(self, state):
-        # For first layer, estimated_topk is all -1 and hit_mask is all False
-        state.hit_mask, state.miss_mask = self.usc_cache._verify_cache(
-            state.topk_output, state.estimated_topk
-        )
+    # reused operations: op_usc_estimate_a, op_usc_estimate_b, op_usc_topk, usc_index_estimate, op_usc_verify
+    def op_usc_ep_forward(self, state):
+        self.op_usc_estimate_b(state)
+
+        self.op_usc_ep_hit_dispatch_a(state)
+        self.op_usc_ep_hit_dispatch_b(state)
         
+        self.op_usc_topk(state)
+        self.op_usc_verify(state)
+
+        self.op_usc_ep_miss_dispatch_a(state)
+        self.op_usc_ep_miss_dispatch_b(state)
+
+        self.op_usc_ep_hit_expert_a(state)
+        self.op_usc_ep_hit_expert_b(state)
+
+        self.op_usc_ep_hit_combine_a(state)
+        self.op_usc_ep_hit_combine_b(state)
+
+        self.op_usc_ep_miss_expert_a(state)
+        self.op_usc_ep_miss_expert_b(state)
+
+        self.op_usc_ep_miss_combine_a(state)
+        self.op_usc_ep_miss_combine_b(state)
+
+        self.op_usc_estimate_a(state)
+
+        self.op_usc_output(state)
+
+
     def op_usc_ep_hit_dispatch_a(self, state):
         state.estimated_topk.topk_weights.fill_(1.0)
 
@@ -1201,12 +1224,10 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def op_usc_ep_hit_combine_a(self, state):
-        state.hit_varlen_combine_output = self.usc_cache.combine_a(
-            state.pop("hit_varlen_combine_output"),
-            state.pop("miss_varlen_combine_output"),
+        self.usc_cache.hit_combine_a(
+            state.pop("hit_varlen_expert_output"),
             state.pop("hit_mask"),
             state.pop("miss_mask"),
-            self.routed_scaling_factor,
             state.pop("estimated_topk"),
             state.pop("topk_output"),
         )
@@ -1235,14 +1256,12 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def op_usc_ep_miss_combine_a(self, state):
-        state.miss_varlen_combine_output = self.usc_cache.miss_combine_a(
+        self.usc_cache.miss_combine_a(
             state.pop("miss_varlen_expert_output")
         )
 
     def op_usc_ep_miss_combine_b(self, state):
-        miss_varlen_combine_output = self.usc_cache.miss_combine_b(
-            state.pop("hit_varlen_combine_output")
-        )
+        miss_varlen_combine_output = self.usc_cache.miss_combine_b()
 
         state.hidden_states_after_combine = miss_varlen_combine_output + state.pop("hit_varlen_combine_output")
 
@@ -3358,7 +3377,7 @@ class DeepseekV2Model(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo or (is_usc_enabled() and forward_batch.forward_mode.is_decode()):
+        if forward_batch.can_run_tbo or (is_usc_enabled() and (forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_target_verify())):
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer
