@@ -42,6 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
+from sglang.srt.layers.moe.utils import is_usc_enabled
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -1017,7 +1018,7 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
 class MaybeTboDeepEPDispatcher(BaseDispatcher):
     def __init__(self, **kwargs):
         super().__init__()
-        num_inner_dispatchers = 2 if is_tbo_enabled() else 1
+        num_inner_dispatchers = 2 if is_tbo_enabled() or is_usc_enabled() else 1
         if get_moe_a2a_backend().is_deepep():
             self._inners = [
                 DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)

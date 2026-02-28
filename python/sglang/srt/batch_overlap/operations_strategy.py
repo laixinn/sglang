@@ -202,6 +202,53 @@ def _compute_moe_usc_decode(layer):
         ],
     )
 
+def _compute_ep_moe_usc_decode(layer):
+    device_properties = torch.cuda.get_device_properties(device="cuda")
+    total_num_sms = device_properties.multi_processor_count
+    deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+
+    # TODO: add YieldOperation
+    return OperationsStrategy(
+        deep_gemm_num_sms=deep_gemm_num_sms,
+        tbo_delta_stages=0,
+        operations=[
+            layer.op_usc_comm_prepare_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
+            layer.op_usc_comm_prepare_mlp,
+            
+            layer.mlp.op_usc_estimate_b, # estimated topk is ready
+
+            # hit: dispatch | miss: topk + verify
+            layer.mlp.op_usc_ep_hit_dispatch_a,
+            layer.mlp.op_usc_topk,
+            layer.mlp.op_usc_ep_verify,
+
+            # hit: MoE calculation | miss: dispatch
+            layer.mlp.op_usc_ep_miss_dispatch_a,
+            layer.mlp.op_usc_ep_hit_dispatch_b,
+            layer.mlp.op_usc_ep_hit_expert_a,
+            
+            # hit: combine | miss: MoE calculation
+            layer.mlp.op_usc_ep_hit_expert_b,
+            layer.mlp.op_usc_hit_combine_a,
+            layer.mlp.op_usc_ep_miss_dispatch_b,
+            layer.mlp.op_usc_ep_miss_expert_a,
+
+            # hit: next topk | miss: combine
+            layer.mlp.op_usc_ep_hit_combine_b,
+            layer.mlp.op_usc_ep_miss_expert_b,
+            layer.mlp.op_usc_ep_miss_combine_a,
+            layer.mlp.op_usc_estimate_a,
+
+            # reduce hit and miss results
+            layer.mlp.op_usc_ep_miss_combine_b,
+            layer.mlp.op_usc_output,
+
+            layer.op_usc_comm_postprocess_layer,
+        ],
+    )
+
 
 # -------------------------------- Strategy for Qwen3 ---------------------------------------
 

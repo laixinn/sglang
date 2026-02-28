@@ -175,6 +175,7 @@ from sglang.srt.utils import (
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.usc.moe_cache import (
     USCTPMoECache, 
+    USCEPMoECache,
 )
 from sglang.srt.layers.moe.utils import is_usc_enabled
 
@@ -595,7 +596,7 @@ class DeepseekV2MoE(nn.Module):
 
         if is_usc_enabled():
             if get_moe_a2a_backend().is_deepep():
-                pass
+                self.usc_cache = USCEPMoECache()
             else:
                 self.usc_cache = USCTPMoECache(self.experts)
 
@@ -1169,6 +1170,81 @@ class DeepseekV2MoE(nn.Module):
             estimated_topk = self.topk.full_topk_output(hidden_states.device, hidden_states.shape[0], True)
 
         return estimated_topk
+
+    # EP operations
+    # reused operations: op_usc_estimate_a, op_usc_estimate_b, op_usc_topk, usc_index_estimate
+    def op_usc_ep_verify(self, state):
+        # For first layer, estimated_topk is all -1 and hit_mask is all False
+        state.hit_mask, state.miss_mask = self.usc_cache._verify_cache(
+            state.topk_output, state.estimated_topk
+        )
+        
+    def op_usc_ep_hit_dispatch_a(self, state):
+        state.estimated_topk.topk_weights.fill_(1.0)
+
+        self.usc_cache.hit_dispatch_a(
+            hidden_states=state.hidden_states_mlp_input,
+            estimated_topk=state.estimated_topk,
+        )
+
+    def op_usc_ep_hit_dispatch_b(self, state):
+        state.hit_varlen_dispatch_output = self.usc_cache.hit_dispatch_b()
+
+    def op_usc_ep_hit_expert_a(self, state):
+        state.hit_varlen_expert_output = self.usc_cache.forward_expert_a(
+            state.pop("hit_varlen_dispatch_output")
+        )
+
+    def op_usc_ep_hit_expert_b(self, state):
+        state.hit_varlen_expert_output = self.usc_cache.forward_expert_b(
+            state.pop("hit_varlen_expert_output")
+        )
+
+    def op_usc_ep_hit_combine_a(self, state):
+        state.hit_varlen_combine_output = self.usc_cache.combine_a(
+            state.pop("hit_varlen_combine_output"),
+            state.pop("miss_varlen_combine_output"),
+            state.pop("hit_mask"),
+            state.pop("miss_mask"),
+            self.routed_scaling_factor,
+            state.pop("estimated_topk"),
+            state.pop("topk_output"),
+        )
+
+    def op_usc_ep_hit_combine_b(self, state):
+        state.hit_varlen_combine_output = self.usc_cache.hit_combine_b()
+
+    def op_usc_ep_miss_dispatch_a(self, state):
+        self.usc_cache.miss_dispatch_a(
+                hidden_states=state.hidden_states_mlp_input,
+                grounded_topk=state.topk_output,
+                miss_mask=state.miss_mask,
+            )
+
+    def op_usc_ep_miss_dispatch_b(self, state):
+        state.miss_varlen_dispatch_output = self.usc_cache.miss_dispatch_b()
+
+    def op_usc_ep_miss_expert_a(self, state):
+        state.miss_varlen_expert_output = self.usc_cache.forward_expert_a(
+            state.pop("miss_varlen_dispatch_output")
+        )
+
+    def op_usc_ep_miss_expert_b(self, state):
+        state.miss_varlen_expert_output = self.usc_cache.forward_expert_b(
+            state.pop("miss_varlen_expert_output")
+        )
+
+    def op_usc_ep_miss_combine_a(self, state):
+        state.miss_varlen_combine_output = self.usc_cache.miss_combine_a(
+            state.pop("miss_varlen_expert_output")
+        )
+
+    def op_usc_ep_miss_combine_b(self, state):
+        miss_varlen_combine_output = self.usc_cache.miss_combine_b(
+            state.pop("hit_varlen_combine_output")
+        )
+
+        state.hidden_states_after_combine = miss_varlen_combine_output + state.pop("hit_varlen_combine_output")
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
