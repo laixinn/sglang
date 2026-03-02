@@ -1147,12 +1147,19 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = state.pop("hidden_states_after_combine")
 
         if (shared_output := state.pop("shared_output")) is not None:
-            final_hidden_states += shared_output
+            # TODO: check TP case
+            # final_hidden_states += shared_output
+            x = shared_output
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            final_hidden_states *= self.routed_scaling_factor
 
         if (
             self.tp_size > 1
             and not state.pop("should_allreduce_fusion")
             and not state.pop("use_reduce_scatter")
+            and not get_moe_a2a_backend().is_deepep()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
