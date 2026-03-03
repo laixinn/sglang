@@ -1577,9 +1577,17 @@ class DeepseekV2AttentionMLA(nn.Module):
             state._usc_predicted_indices = None
             return
 
+        # ── Shared QK output buffer ──
+        s_q, h_q, _ = q_all.shape
+        topk = predicted_indices.shape[-1]
+        qk_buf = self.usc_attn_cache.ensure_qk_buf(
+            s_q, h_q, topk, q_all.device,
+        )
+
         state.attn_predicted_qk = (
-            self.usc_attn_cache.compute_qk_scores_pytorch(
+            self.usc_attn_cache.compute_qk_scores(
                 q_all, predicted_indices, sm_scale, kv_pool,
+                qk_buf=qk_buf,
             )
         )
         state._usc_predicted_indices = predicted_indices

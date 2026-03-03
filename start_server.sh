@@ -3,14 +3,14 @@
 # 编译 FlashMLA 算子
 # cd FlashMLA-src 
 # MAX_JOBS=4 FLASH_MLA_FORCE_CXX=g++-12 FLASH_MLA_DISABLE_SM100=1 python setup.py build_ext 
-export PYTHONPATH=/home/hadoop-djst-algoplat/sglang/FlashMLA-src:$PYTHONPATH
+export PYTHONPATH=/workdir/sglang/FlashMLA-src:$PYTHONPATH
 
 unset http_proxy && unset https_proxy && unset HTTP_PROXY && unset HTTPS_PROXY
 
-# Debug: force synchronous CUDA execution to pinpoint OOB kernel
-export USC_DEBUG_SYNC=1
+export SGLANG_TORCH_PROFILER_DIR=/workdir/sglang/profile_log
+mkdir -p $SGLANG_TORCH_PROFILER_DIR
 
-MODEL_PATH=/home/hadoop-djst-algoplat/models/deepseek-ai/DeepSeek-V3.2-Exp/
+MODEL_PATH=/workdir/models/deepseek-ai/DeepSeek-V3.2-Exp/
 
 python3 -m sglang.launch_server \
         --model-path $MODEL_PATH \
@@ -37,4 +37,4 @@ python3 -m sglang.launch_server \
 # nohup python3 benchmark/gsm8k/bench_sglang.py --host http://localhost --port 8418 --num-questions 140 > gsm8k_bench.log 2>&1 &
 
 # benchmark
-# python3 -m sglang.bench_serving --backend sglang --model /home/hadoop-djst-algoplat/models/deepseek-ai/DeepSeek-V3.2-Exp/ --port 8418 --dataset-name generated-shared-prefix --gsp-num-groups 1 --gsp-prompts-per-group 12 --gsp-question-len 1024 --gsp-output-len 1536 --request-rate inf --gsp-system-prompt-len 3072  --max-concurrency 4 
+# python3 -m sglang.bench_serving --backend sglang --model /workdir/models/deepseek-ai/DeepSeek-V3.2-Exp/ --port 8418 --dataset-name generated-shared-prefix --gsp-num-groups 1 --gsp-prompts-per-group 12 --gsp-question-len 1024 --gsp-output-len 1536 --request-rate inf --gsp-system-prompt-len 3072  --max-concurrency 4 --profile --profile-num-steps 5
