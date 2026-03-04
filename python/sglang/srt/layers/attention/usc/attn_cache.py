@@ -10,6 +10,8 @@ logger = logging.getLogger(__name__)
 from flash_mla import flash_mla_sparse_merge_fwd as _sparse_merge_fwd
 _HAS_SPARSE_MERGE_KERNEL = True
 
+import deep_gemm
+
 import triton
 import triton.language as tl
 
@@ -215,10 +217,6 @@ def _fused_verify_remap(
         hit_mask:  [N, topk] int8  (1=hit, 0=not-hit — same memory layout as bool)
         miss_mask: [N, topk] int8  (1=miss, 0=not-miss)
         remap_pos: [N, topk] int32 (position in predicted for hits, 0 otherwise)
-
-    Note: outputs are int8 instead of bool to avoid 2× ``_to_copy``
-    (int8→bool) + ``cudaLaunchKernel`` per call.  Downstream Triton
-    kernels load as int8 anyway (``tl.load(...).to(tl.int32)``).
     """
     N, topk = actual_indices.shape
     pred_topk = predicted_indices.shape[-1]
@@ -432,6 +430,7 @@ def _fused_partition_and_prepare(
     h_q: int, h_padded: int,
     pool_sz: int, d_qk: int,
     has_hit: bool,
+    skip_q_copy: bool = False,
 ):
     """Single kernel: binary partition (miss-first) + write + q_buf copy.
 
@@ -442,15 +441,24 @@ def _fused_partition_and_prepare(
 
     Requires qk_buf and q_buf to be zero-initialized at allocation.
     Padding-head regions (h >= h_q) are never written by this kernel.
+
+    Args:
+        skip_q_copy: If True, skip the q_all → q_buf copy (assumes q_all is already aligned)
     """
     s_q = actual_indices.shape[0]
     BLOCK_TOPK = triton.next_power_of_2(topk_padded)
-    BLOCK_D    = 128
-    n_d_blocks = triton.cdiv(d_qk, BLOCK_D)
-    grid = (s_q, 1 + n_d_blocks)
 
     # Choose num_warps: more warps for larger BLOCK_TOPK
     num_warps = max(4, min(BLOCK_TOPK // 64, 16))
+
+    if skip_q_copy:
+        # Only run partition programs (pid_b == 0), skip q-copy programs
+        grid = (s_q, 1)
+        BLOCK_D = 128  # Not used but needed for kernel signature
+    else:
+        BLOCK_D = 128
+        n_d_blocks = triton.cdiv(d_qk, BLOCK_D)
+        grid = (s_q, 1 + n_d_blocks)
 
     if has_hit:
         hit_ptr       = hit_mask
@@ -518,7 +526,7 @@ class USCSparseAttnCache:
         self._hit_rate_print_interval = 100
         
         # Async stream for hit attention (set to None to disable dual-stream)
-        self.alt_stream = None  # torch.cuda.Stream()
+        self.alt_stream = None # torch.cuda.Stream()
         self.alt_event0 = torch.cuda.Event()
         self.alt_event1 = torch.cuda.Event()
         
@@ -600,11 +608,11 @@ class USCSparseAttnCache:
         # Round s_q up to next 256 to reduce future re-allocations
         alloc_sq = ((s_q + 255) // 256) * 256
         cls._shared_qk_buf = torch.empty(
-            alloc_sq, h_q, topk, dtype=torch.float32, device=device,
+            alloc_sq, h_q, topk, dtype=torch.bfloat16, device=device,
         )
         logger.info(
             f"[USC] allocated shared QK buf: {list(cls._shared_qk_buf.shape)} "
-            f"({cls._shared_qk_buf.nelement() * 4 / 1024 / 1024:.0f} MB)"
+            f"({cls._shared_qk_buf.nelement() * 2 / 1024 / 1024:.0f} MB)"
         )
         return cls._shared_qk_buf
 
@@ -619,8 +627,13 @@ class USCSparseAttnCache:
         cls,
         s_q: int, h_q: int, h_padded: int, topk_padded: int,
         d_qk: int, dtype: torch.dtype, device: torch.device,
+        skip_q_buf: bool = False,
     ):
-        """Lazy-allocate miss-reduce kernel buffers. Grows but never shrinks."""
+        """Lazy-allocate miss-reduce kernel buffers. Grows but never shrinks.
+
+        Args:
+            skip_q_buf: If True, skip allocating q_buf (used when h_q is already aligned)
+        """
         alloc_sq = ((s_q + 255) // 256) * 256
 
         # idx / hit buffers — small (a few MB)
@@ -659,21 +672,21 @@ class USCSparseAttnCache:
                 f"({cls._shared_mr_qk_buf.nelement() * 4 / 1024 / 1024:.0f} MB)"
             )
 
-        # q buffer — ZERO-initialized for same reason as qk_buf.
-        # The write kernel only fills H_Q data heads.
-        if (
-            cls._shared_mr_q_buf is None
-            or cls._shared_mr_q_buf.shape[0] < s_q
-            or cls._shared_mr_q_buf.shape[1] < h_padded
-            or cls._shared_mr_q_buf.shape[2] < d_qk
-        ):
-            cls._shared_mr_q_buf = torch.zeros(
-                alloc_sq, h_padded, d_qk, dtype=dtype, device=device,
-            )
-            logger.info(
-                f"[USC] allocated shared MR Q buf (zero-init): "
-                f"{list(cls._shared_mr_q_buf.shape)} dtype={dtype}"
-            )
+        # q buffer — only allocate if needed (when h_q requires padding)
+        if not skip_q_buf:
+            if (
+                cls._shared_mr_q_buf is None
+                or cls._shared_mr_q_buf.shape[0] < s_q
+                or cls._shared_mr_q_buf.shape[1] < h_padded
+                or cls._shared_mr_q_buf.shape[2] < d_qk
+            ):
+                cls._shared_mr_q_buf = torch.zeros(
+                    alloc_sq, h_padded, d_qk, dtype=dtype, device=device,
+                )
+                logger.info(
+                    f"[USC] allocated shared MR Q buf (zero-init): "
+                    f"{list(cls._shared_mr_q_buf.shape)} dtype={dtype}"
+                )
 
     def _async_execute(self, fn: Callable):
         if self.alt_stream is None:
@@ -1165,107 +1178,156 @@ class USCSparseAttnCache:
         qk_buf: torch.Tensor,     # [>=s_q, >=h_q, >=topk] f32  (from state, shared)
     ) -> torch.Tensor:
         def _fn():
-            s_q, h_q, _ = q_all.shape
+            s_q, h_q, d_qk = q_all.shape
             topk = indices.shape[-1]
-            pool_sz = kv_pool.shape[0]
-            clamp_max = max(pool_sz - 1, 0)           # Python int, no GPU op
-
-            # View into pre-allocated shared buffer — zero allocation.
             out_view = qk_buf[:s_q, :h_q, :topk]
-            _triton_predicted_qk(q_all, indices, kv_pool, out_view)
-            return out_view
-        return self._async_execute(_fn)
 
+            pool_sz = kv_pool.shape[0]
+            safe_idx = indices.clamp(min=0, max=pool_sz - 1)
+            selected_k = kv_pool[safe_idx, 0, :]  # [s_q, topk, d_qk]
 
-    def compute_qk_scores_pytorch(
-        self,
-        q_all: torch.Tensor,      # [s_q, h_q, d_qk]
-        indices: torch.Tensor,     # [s_q, topk]  (PAGED pool slot indices, padded with -1)
-        sm_scale: float,
-        kv_pool: torch.Tensor,    # [pool_size, 1, d_qk]
-    ) -> torch.Tensor:
-        def _fn():
-            """Compute Q@K^T scores for given indices.
-
-            Called from op_usc_hit_a with predicted_indices.
-        
-        Returns:
-                qk_scores: [s_q, h_q, topk], float32, invalid positions = -inf
-            """
-            s_q, h_q, _ = q_all.shape
-            topk = indices.shape[-1]
-            device = q_all.device
-
-            safe_idx, valid_mask, K = self._resolve_kv_and_trim(indices, kv_pool)
-
-            if K == 0 or not valid_mask.any():
-                return torch.full((s_q, h_q, topk), float('-inf'),
-                                dtype=torch.float32, device=device)
-
-            # Gather K: [s_q, K, d_qk]
-            selected_k = kv_pool[safe_idx, 0, :]
-            # _debug_sync("compute_qk_scores_pytorch:gather_k")
-
-            # Q @ K^T: [s_q, h_q, K]
-            qk = torch.bmm(
-                q_all.float().contiguous(),
-                selected_k.float().transpose(1, 2).contiguous(),
+            out_view = torch.bmm(
+                q_all.contiguous(),
+                selected_k.transpose(1, 2).contiguous(),
             ) 
-            # _debug_sync("compute_qk_scores_pytorch:bmm_qk")
+            return out_view
 
-            # Mask invalid → -inf
-            qk.masked_fill_(~valid_mask.unsqueeze(1), float('-inf'))
-
-            if K == topk:
-                return qk
-
-            # Pad back to original topk dimension
-            out = torch.full((s_q, h_q, topk), float('-inf'),
-                            dtype=torch.float32, device=device)
-            out[:, :, :K] = qk
-            return out
-
+            # # Try DeepGEMM BF16 path for Q@K^T
+            # try:
+            #     # Clamp indices to valid range
+            #     pool_sz = kv_pool.shape[0]
+            #     safe_idx = indices.clamp(min=0, max=pool_sz - 1)
+                
+            #     # Gather K: [s_q, topk, d_qk] - this is the expensive indirect access
+            #     # DeepGEMM can't do gather, so we do it first
+            #     selected_k = kv_pool[safe_idx, 0, :]  # [s_q, topk, d_qk]
+                
+            #     # Use DeepGEMM bf16_gemm_nt for Q@K^T
+            #     # Input: q_all [s_q, h_q, d_qk], selected_k [s_q, topk, d_qk]
+            #     # Output: qk [s_q, h_q, topk]
+                
+            #     # Prepare contiguous tensors
+            #     # q_contig = q_all.contiguous()  # [s_q, h_q, d_qk]
+            #     # k_contig = selected_k.contiguous()  # [s_q, topk, d_qk]
+                
+            #     # if s_q == 1:
+            #     #     # Single sample case: use 2D gemm directly
+            #     #     # q: [h_q, d_qk], k: [topk, d_qk], out: [h_q, topk]
+            #     #     q_2d = q_contig[0]  # [h_q, d_qk]
+            #     #     k_2d = k_contig[0]  # [topk, d_qk]
+            #     #     # bf16_gemm_nt expects: lhs [M, K], rhs [N, K], out [M, N]
+            #     #     # Here M=h_q, K=d_qk, N=topk
+            #     #     # out_view[0] is already [h_q, topk] bf16, use it directly
+            #     #     deep_gemm.bf16_gemm_nt(q_2d, k_2d, out_view[0])
+            #     # else:
+            #     #     # Batched case: process each sample, write directly to out_view
+            #     #     for i in range(s_q):
+            #     #         # q_i: [h_q, d_qk], k_i: [topk, d_qk]
+            #     #         # out_view[i] is [h_q, topk] bf16, use directly as output buffer
+            #     #         deep_gemm.bf16_gemm_nt(q_contig[i], k_contig[i], out_view[i])
+            #     for i in range(s_q):
+            #         deep_gemm.bf16_gemm_nt(q_all[i], selected_k[i], out_view[i]) # q_i: [h_q, d_qk], k_i: [topk, d_qk]
+            #         # deep_gemm.bf16_gemm_nt(q_contig[i], k_contig[i], out_view[i]) # q_i: [h_q, d_qk], k_i: [topk, d_qk]
+            #     return out_view
+                
+            # except Exception as e:
+            #     # Fallback to Triton kernel
+            #     logger.debug(f"DeepGEMM BF16 failed in compute_qk_scores, fallback to Triton: {e}")
+            #     _triton_predicted_qk(q_all, indices, kv_pool, out_view)
+            #     return out_view
         return self._async_execute(_fn)
 
-    def verify_cache_v2(
-        self,
-        actual_indices: Optional[torch.Tensor],
-        predicted_indices: Optional[torch.Tensor],
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Compare predicted vs actual sparse index, return hit_mask and miss_mask.
 
-        Also computes remap_pos (position of each actual index inside the
-        predicted array) as a side-product and stores it in
-        ``self._last_remap_pos`` for consumption by ``_compute_miss_reduce_kernel``.
+    # def compute_qk_scores_pytorch(
+    #     self,
+    #     q_all: torch.Tensor,      # [s_q, h_q, d_qk]
+    #     indices: torch.Tensor,     # [s_q, topk]  (PAGED pool slot indices, padded with -1)
+    #     sm_scale: float,
+    #     kv_pool: torch.Tensor,    # [pool_size, 1, d_qk]
+    # ) -> torch.Tensor:
+    #     def _fn():
+    #         """Compute Q@K^T scores for given indices.
 
-        Args:
-            actual_indices: [num_tokens, topk] actual sparse index
-            predicted_indices: [num_tokens, topk] predicted sparse index
+    #         Called from op_usc_hit_a with predicted_indices.
         
-        Returns:
-            hit_mask:  [num_tokens, topk] on actual_indices, True where hit
-            miss_mask: [num_tokens, topk] on actual_indices, True where miss
-        """
-        if actual_indices is None:
-            self._last_remap_pos = None
-            return None, None
+    #     Returns:
+    #             qk_scores: [s_q, h_q, topk], float32, invalid positions = -inf
+    #         """
+    #         s_q, h_q, _ = q_all.shape
+    #         topk = indices.shape[-1]
+    #         device = q_all.device
 
-        if predicted_indices is None:
-            # No prediction → everything is miss, nothing is hit.
-            # Use int8 to match _fused_verify_remap output dtype.
-            self._last_remap_pos = None
-            shape = actual_indices.shape
-            dev = actual_indices.device
-            return (
-                torch.zeros(shape, dtype=torch.int8, device=dev),
-                torch.ones(shape, dtype=torch.int8, device=dev),
-            )
+    #         safe_idx, valid_mask, K = self._resolve_kv_and_trim(indices, kv_pool)
 
-        hit_mask, miss_mask, remap_pos = _fused_verify_remap(
-            actual_indices, predicted_indices,
-        )
-        self._last_remap_pos = remap_pos
-        return hit_mask, miss_mask
+    #         if K == 0 or not valid_mask.any():
+    #             return torch.full((s_q, h_q, topk), float('-inf'),
+    #                             dtype=torch.float32, device=device)
+
+    #         # Gather K: [s_q, K, d_qk]
+    #         selected_k = kv_pool[safe_idx, 0, :]
+    #         # _debug_sync("compute_qk_scores_pytorch:gather_k")
+
+    #         # Q @ K^T: [s_q, h_q, K]
+    #         # Try DeepGEMM BF16 first, fallback to bmm
+    #         try:
+    #             import deep_gemm
+    #             # DeepGEMM bf16_gemm_nt: lhs [M, K] @ rhs [N, K]^T -> out [M, N]
+    #             # For batched case [s_q, h_q, d_qk] @ [s_q, K, d_qk]^T -> [s_q, h_q, K]
+    #             # We process each batch item: s_q groups of (h_q, d_qk) @ (K, d_qk)
+    #             if s_q <= 4:  # Small batch, use direct 2D approach
+    #                 q_2d = q_all.reshape(s_q * h_q, d_qk).contiguous()
+    #                 k_2d = selected_k.reshape(s_q * K, d_qk).contiguous()
+    #                 qk_out = torch.empty(s_q * h_q, K, dtype=torch.bfloat16, device=device)
+    #                 deep_gemm.bf16_gemm_nt(q_2d, k_2d, qk_out)
+    #                 qk = qk_out.view(s_q, h_q, K).float()
+    #             else:
+    #                 # Large batch: process one at a time to avoid huge contiguous copies
+    #                 qk_bf16 = torch.empty((s_q, h_q, K), dtype=torch.bfloat16, device=device)
+    #                 for i in range(s_q):
+    #                     q_i = q_all[i].contiguous()  # [h_q, d_qk]
+    #                     k_i = selected_k[i].contiguous()  # [K, d_qk]
+    #                     out_i = qk_bf16[i]  # [h_q, K]
+    #                     deep_gemm.bf16_gemm_nt(q_i, k_i, out_i)
+    #                 qk = qk_bf16.float()
+    #         except Exception as e:
+    #             # Fallback to PyTorch bmm
+    #             qk = torch.bmm(
+    #                 q_all.float().contiguous(),
+    #                 selected_k.float().transpose(1, 2).contiguous(),
+    #             ) 
+    #         # _debug_sync("compute_qk_scores_pytorch:bmm_qk")
+
+    #         # Mask invalid → -inf
+    #         qk.masked_fill_(~valid_mask.unsqueeze(1), float('-inf'))
+
+    #         if K == topk:
+    #             return qk
+
+    #         # Pad back to original topk dimension
+    #         out = torch.full((s_q, h_q, topk), float('-inf'),
+    #                         dtype=torch.float32, device=device)
+    #         out[:, :, :K] = qk
+    #         return out
+
+    #     return self._async_execute(_fn)
+
+    # def verify_cache_v2(
+    #     self,
+    #     actual_indices: Optional[torch.Tensor],
+    #     predicted_indices: Optional[torch.Tensor],
+    # ) -> None:
+    #     """Store actual and predicted indices for later miss-reduce computation.
+
+    #     The actual hit/miss mask computation is deferred to _compute_miss_reduce_triton
+    #     to eliminate intermediate buffer materialization.
+
+    #     Args:
+    #         actual_indices: [num_tokens, topk] actual sparse index
+    #         predicted_indices: [num_tokens, topk] predicted sparse index
+    #     """
+    #     # Store for later use in compute_miss_reduce
+    #     self._verify_actual_indices = actual_indices
+    #     self._verify_predicted_indices = predicted_indices
 
     def _apply_wvc_absorption(
         self,
@@ -1369,8 +1431,6 @@ class USCSparseAttnCache:
         attn_module: nn.Module,
         q_all: torch.Tensor,                        # [s_q, h_q, d_qk]
         actual_indices: torch.Tensor,                # [s_q, topk]  (PAGED, padded with -1)
-        hit_mask: Optional[torch.Tensor],            # [s_q, topk]
-        miss_mask: Optional[torch.Tensor],           # [s_q, topk]
         predicted_qk: Optional[torch.Tensor],        # [s_q, h_q, pred_topk]
         predicted_indices: Optional[torch.Tensor],   # [s_q, pred_topk]
         sm_scale: float,
@@ -1382,6 +1442,8 @@ class USCSparseAttnCache:
         Tries the fused CUDA kernel first (miss-only QK + hit load + softmax + PV).
         Falls back to the PyTorch implementation if the kernel is unavailable.
         
+        Hit/miss masks are computed internally to eliminate intermediate buffer materialization.
+        
         Returns:
             attn_output_3d: [s_q, h_q, v_head_dim] after w_vc absorption
         """
@@ -1389,15 +1451,14 @@ class USCSparseAttnCache:
             _HAS_SPARSE_MERGE_KERNEL
             and q_all.dtype == torch.bfloat16
         ):
-            # logger.info(">>> dispatch to _compute_miss_reduce_kernel  s_q=%d h_q=%d", q_all.shape[0], q_all.shape[1])
             return self._compute_miss_reduce_kernel(
-                attn_module, q_all, actual_indices, hit_mask, miss_mask,
+                attn_module, q_all, actual_indices,
                 predicted_qk, predicted_indices, sm_scale, zero_allocator, kv_pool,
             )
         else:
             logger.info(">>> fallback: _HAS_SPARSE_MERGE_KERNEL=%s dtype=%s", _HAS_SPARSE_MERGE_KERNEL, q_all.dtype)
             return self._compute_miss_reduce_pytorch(
-                attn_module, q_all, actual_indices, hit_mask, miss_mask,
+                attn_module, q_all, actual_indices,
                 predicted_qk, predicted_indices, sm_scale, zero_allocator, kv_pool,
             )
 
@@ -1406,80 +1467,125 @@ class USCSparseAttnCache:
         attn_module: nn.Module,
         q_all: torch.Tensor,
         actual_indices: torch.Tensor,
-        hit_mask: Optional[torch.Tensor],
-        miss_mask: Optional[torch.Tensor],
         predicted_qk: Optional[torch.Tensor],
         predicted_indices: Optional[torch.Tensor],
         sm_scale: float,
         zero_allocator,
         kv_pool: torch.Tensor,
     ) -> torch.Tensor:
-        """Optimised miss-reduce: 1 fused Triton kernel.
+        """Optimised miss-reduce: fused Triton kernels with eliminated intermediate buffers.
+
+        Optimizations:
+        1. Eliminates intermediate hit_mask/remap_pos buffers by computing them on-demand
+        2. Skips q_buf copy when h_q is already aligned (h_q % 64 == 0)
 
         The miss-first ordering is **required** by the CUDA merge kernel's
-        ``is_block_all_hit(block_start)`` optimisation — it checks only the
-        first position of each B_TOPK=64 block to decide whether to skip
-        the entire QK GEMM for the block.
-
-        Flow (single Triton launch):
-          ``_fused_partition_and_prepare`` — binary stable partition via
-          ``tl.cumsum`` (miss → front, hit+invalid → back) + scatter-write
-          to idx/hit/qk bufs + q_buf copy.  **H_Q heads only** since
-          padding is pre-zeroed.  No ``torch.sort``, no perm tensor, no
-          ``cudaMemcpyAsync``.
+        ``is_block_all_hit(block_start)`` optimisation.
         """
         s_q, h_q, d_qk = q_all.shape
         kv_lora_rank = attn_module.kv_lora_rank
         device = q_all.device
-        topk = actual_indices.shape[-1]         
+        topk = actual_indices.shape[-1]
         pool_sz = kv_pool.shape[0]
 
         # ---- Kernel alignment (pure Python, zero GPU ops) ----
         B_TOPK_2 = 128
         B_H = 64
         topk_padded = ((topk + B_TOPK_2 - 1) // B_TOPK_2) * B_TOPK_2
-        h_padded    = ((h_q + B_H - 1) // B_H) * B_H
+        h_padded = ((h_q + B_H - 1) // B_H) * B_H
         pad_h = h_padded - h_q
 
+        # ---- Determine if we can skip q_buf copy ----
+        skip_q_copy = (pad_h == 0)
+
         # ---- Pre-allocate / reuse kernel buffers (zero-initialized) ----
+        # Only allocate q_buf if we need padding, otherwise use q_all directly
         self._ensure_mr_bufs(
             s_q, h_q, h_padded, topk_padded, d_qk, q_all.dtype, device,
+            skip_q_buf=skip_q_copy,
         )
         idx_buf = self._shared_mr_idx_buf[:s_q, :, :topk_padded]
         hit_buf = self._shared_mr_hit_buf[:s_q, :, :topk_padded]
-        qk_buf  = self._shared_mr_qk_buf[:s_q, :h_padded, :topk_padded]
-        q_buf   = self._shared_mr_q_buf[:s_q, :h_padded, :d_qk]
+        qk_buf = self._shared_mr_qk_buf[:s_q, :h_padded, :topk_padded]
 
-        # ---- has_hit: structural check, NO .any() sync ----
+        # Use q_all directly if aligned, otherwise use padded buffer
+        if skip_q_copy:
+            q_buf = q_all  # No copy needed, use directly
+        else:
+            q_buf = self._shared_mr_q_buf[:s_q, :h_padded, :d_qk]
+
+        # ---- has_hit: structural check ----
         has_hit = (
-            hit_mask is not None
-            and predicted_qk is not None
+            predicted_qk is not None
             and predicted_indices is not None
         )
 
-        # ---- Retrieve pre-computed remap_pos from verify step ----
-        remap_pos = self._last_remap_pos
-        self._last_remap_pos = None
+        # ---- Compute hit_mask and remap_pos on-demand (eliminate intermediate buffers) ----
+        if has_hit:
+            # Allocate temporary buffers for verify + remap (computed fresh, not stored)
+            hit_raw = torch.empty(s_q, topk, dtype=torch.int8, device=device)
+            miss_raw = torch.empty(s_q, topk, dtype=torch.int8, device=device)  # Not used but needed for API
+            remap_pos = torch.empty(s_q, topk, dtype=torch.int32, device=device)
 
-        # ---- Fused partition + write + q_buf copy (1 Triton kernel) ----
-        _fused_partition_and_prepare(
-            actual_indices=actual_indices,
-            hit_mask=hit_mask,
-            remap_pos=remap_pos,
-            predicted_qk=predicted_qk,
-            q_all=q_all,
-            idx_buf=idx_buf,
-            hit_buf=hit_buf,
-            qk_buf=qk_buf,
-            q_buf=q_buf,
-            topk=topk,
-            topk_padded=topk_padded,
-            h_q=h_q,
-            h_padded=h_padded,
-            pool_sz=pool_sz,
-            d_qk=d_qk,
-            has_hit=has_hit,
-        )
+            _fused_verify_remap_kernel[(s_q, triton.cdiv(topk, 64))](
+                actual_indices,
+                predicted_indices,
+                hit_raw,
+                miss_raw,
+                remap_pos,
+                topk, predicted_indices.shape[-1],
+                actual_indices.stride(0), predicted_indices.stride(0),
+                BLOCK_A=64, BLOCK_P=64,
+            )
+            hit_mask_for_partition = hit_raw
+        else:
+            hit_mask_for_partition = None
+            remap_pos = None
+
+        # ---- Fused partition + write + (optional) q_buf copy ----
+        # Adjust grid based on whether we need q-copy
+        if skip_q_copy:
+            # Skip q-copy: only run partition programs (pid_b == 0)
+            # Modify _fused_partition_and_prepare to handle this
+            _fused_partition_and_prepare(
+                actual_indices=actual_indices,
+                hit_mask=hit_mask_for_partition,
+                remap_pos=remap_pos,
+                predicted_qk=predicted_qk,
+                q_all=q_all,
+                idx_buf=idx_buf,
+                hit_buf=hit_buf,
+                qk_buf=qk_buf,
+                q_buf=q_buf if not skip_q_copy else q_all,  # Not used if skip_q_copy
+                topk=topk,
+                topk_padded=topk_padded,
+                h_q=h_q,
+                h_padded=h_padded,
+                pool_sz=pool_sz,
+                d_qk=d_qk,
+                has_hit=has_hit,
+                skip_q_copy=skip_q_copy,  # New parameter
+            )
+        else:
+            _fused_partition_and_prepare(
+                actual_indices=actual_indices,
+                hit_mask=hit_mask_for_partition,
+                remap_pos=remap_pos,
+                predicted_qk=predicted_qk,
+                q_all=q_all,
+                idx_buf=idx_buf,
+                hit_buf=hit_buf,
+                qk_buf=qk_buf,
+                q_buf=q_buf,
+                topk=topk,
+                topk_padded=topk_padded,
+                h_q=h_q,
+                h_padded=h_padded,
+                pool_sz=pool_sz,
+                d_qk=d_qk,
+                has_hit=has_hit,
+                skip_q_copy=False,
+            )
 
         # ---- Launch sparse merge kernel ----
         output, _max_logits, _lse = _sparse_merge_fwd(
@@ -1505,21 +1611,16 @@ class USCSparseAttnCache:
         attn_module: nn.Module,
         q_all: torch.Tensor,
         actual_indices: torch.Tensor,
-        hit_mask: Optional[torch.Tensor],
-        miss_mask: Optional[torch.Tensor],
         predicted_qk: Optional[torch.Tensor],
         predicted_indices: Optional[torch.Tensor],
         sm_scale: float,
         zero_allocator,
         kv_pool: torch.Tensor,
     ) -> torch.Tensor:
-        """PyTorch fallback for compute_miss_reduce."""
-        # Fallback uses boolean indexing / ~mask, so ensure bool dtype.
-        if hit_mask is not None and hit_mask.dtype != torch.bool:
-            hit_mask = hit_mask.bool()
-        if miss_mask is not None and miss_mask.dtype != torch.bool:
-            miss_mask = miss_mask.bool()
+        """PyTorch fallback for compute_miss_reduce.
 
+        Computes hit/miss masks on-demand to eliminate intermediate buffer materialization.
+        """
         s_q, h_q, d_qk = q_all.shape
         kv_lora_rank = attn_module.kv_lora_rank
         device = q_all.device
@@ -1527,17 +1628,32 @@ class USCSparseAttnCache:
         # ---- Trim + clamp ----
         safe_idx, valid_mask, K = self._resolve_kv_and_trim(actual_indices, kv_pool)
 
-        if hit_mask is not None and hit_mask.shape[-1] > K:
-            hit_mask = hit_mask[:, :K]
-        if miss_mask is not None and miss_mask.shape[-1] > K:
-            miss_mask = miss_mask[:, :K]
+        # ---- Compute hit/miss masks on-demand ----
+        hit_mask = None
+        miss_mask = None
+        has_hit = False
+        has_miss = False
 
-        has_miss = miss_mask is not None and miss_mask.any()
-        has_hit = (
-            hit_mask is not None and hit_mask.any()
-            and predicted_qk is not None
-            and predicted_indices is not None
-        )
+        if predicted_indices is not None and K > 0:
+            # Simple vectorized hit detection: actual in predicted
+            # Expand for broadcasting: actual [s_q, K, 1] vs predicted [s_q, 1, pred_topk]
+            pred_topk = predicted_indices.shape[-1]
+            actual_exp = actual_indices[:, :K].unsqueeze(-1)  # [s_q, K, 1]
+            pred_exp = predicted_indices.unsqueeze(1)  # [s_q, 1, pred_topk]
+
+            # hit: actual index appears in predicted
+            hit_mask_2d = (actual_exp == pred_exp).any(dim=-1)  # [s_q, K]
+            miss_mask_2d = ~hit_mask_2d & valid_mask
+
+            hit_mask = hit_mask_2d
+            miss_mask = miss_mask_2d
+
+            has_hit = hit_mask.any().item()
+            has_miss = miss_mask.any().item()
+        else:
+            # No predictions: all are misses
+            has_miss = valid_mask.any().item()
+            miss_mask = valid_mask
 
         # ---- Build full_qk [s_q, h_q, K] ----
         full_qk = torch.full(

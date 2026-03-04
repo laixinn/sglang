@@ -1602,20 +1602,23 @@ class DeepseekV2AttentionMLA(nn.Module):
         """Compute actual sparse index via the NSA indexer."""
         self.usc_attn_cache.usc_prepare_topk(state, self)
 
-    def op_usc_verify(self, state):
-        """Compare predicted vs actual sparse index → hit_mask, miss_mask."""
-        predicted_indices = state.get("_usc_predicted_indices")
-        actual_sparse_index = state.get("attn_actual_sparse_index")
+    # def op_usc_verify(self, state):
+    #     """Store actual and predicted indices for later miss-reduce computation.
 
-        state.attn_hit_mask, state.attn_miss_mask = (
-            self.usc_attn_cache.verify_cache_v2(
-                actual_sparse_index, predicted_indices,
-            )
-        )
+    #     Hit/miss masks are computed on-demand in compute_miss_reduce to
+    #     eliminate intermediate buffer materialization.
+    #     """
+    #     predicted_indices = state.get("_usc_predicted_indices")
+    #     actual_sparse_index = state.get("attn_actual_sparse_index")
+
+    #     # Store indices for later computation (no intermediate buffers)
+    #     self.usc_attn_cache.verify_cache_v2(
+    #         actual_sparse_index, predicted_indices,
+    #     )
 
     def op_usc_miss_reduce(self, state):
         """
-        1. Compute miss QK scores 
+        1. Compute miss QK scores (with on-demand hit/mask computation)
         2. Map hit QK scores from predicted positions to actual positions
         3. Merge, softmax, PV multiply, w_vc absorption, o_proj
         """
@@ -1623,8 +1626,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv_pool = state.pop("_usc_kv_pool")
         sm_scale = state.pop("_usc_sm_scale")
         actual_indices = state.get("attn_actual_sparse_index")  # kept for estimate_a
-        hit_mask = state.pop("attn_hit_mask")
-        miss_mask = state.pop("attn_miss_mask")
         predicted_qk = state.pop("attn_predicted_qk")
         predicted_indices = state.pop("_usc_predicted_indices")
         intermediate_state = state.pop("usc_attn_intermediate")
@@ -1634,8 +1635,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 attn_module=self,
                 q_all=q_all,
                 actual_indices=actual_indices,
-                hit_mask=hit_mask,
-                miss_mask=miss_mask,
                 predicted_qk=predicted_qk,
                 predicted_indices=predicted_indices,
                 sm_scale=sm_scale,

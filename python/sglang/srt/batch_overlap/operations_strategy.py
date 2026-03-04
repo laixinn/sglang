@@ -183,7 +183,7 @@ def _compute_attn_usc_prefill(layer):
             layer.self_attn.op_usc_prepare, 
             layer.self_attn.op_usc_hit_a,        
             layer.self_attn.op_usc_topk,        
-            layer.self_attn.op_usc_verify,     
+            # layer.self_attn.op_usc_verify,     
             layer.self_attn.op_usc_hit_b,       
             layer.self_attn.op_usc_miss_reduce,     
             layer.self_attn.op_usc_estimate_a, 
