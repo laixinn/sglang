@@ -2223,6 +2223,15 @@ class DeepseekV2AttentionMLA(nn.Module):
     ):
         save_kv_cache = True
 
+        # ===== DEBUG LOG: Print QK shapes and dtypes =====
+        # print(f"[forward_absorb_core] current_attention_backend: {self.current_attention_backend}")
+        # print(f"[forward_absorb_core] FORWARD_ABSORB_CORE_ATTENTION_BACKENDS: {FORWARD_ABSORB_CORE_ATTENTION_BACKENDS}")
+        # print(f"[forward_absorb_core] q_nope_out: shape={q_nope_out.shape}, dtype={q_nope_out.dtype}")
+        # print(f"[forward_absorb_core] q_pe: shape={q_pe.shape if q_pe is not None else None}, dtype={q_pe.dtype if q_pe is not None else None}")
+        # print(f"[forward_absorck_core] k_nope: shape={k_nope.shape}, dtype={k_nope.dtype}")
+        # print(f"[forward_absorb_core] k_pe: shape={k_pe.shape if k_pe is not None else None}, dtype={k_pe.dtype if k_pe is not None else None}")
+        # print(f"[forward_absorb_core] topk_indices: {topk_indices.shape if topk_indices is not None else None}")
+
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
             if self._fuse_rope_for_trtllm_mla(forward_batch):
@@ -2232,6 +2241,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     "llama_4_scaling": llama_4_scaling,
                 }
 
+            # print(f"[forward_absorb_core] Path: FORWARD_ABSORB_CORE_ATTENTION_BACKENDS (attn_mqa)")
             attn_output = self.attn_mqa(
                 q_nope_out,
                 k_nope,
@@ -2243,7 +2253,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
+            print(f"[forward_absorb_core] Path: Non-standard backend")
             if _use_aiter_gfx95:
+                print(f"[forward_absorb_core] Sub-path: _use_aiter_gfx95 (fused_qk_rope_cat_and_cache_mla)")
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
@@ -2267,15 +2279,22 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.rotary_emb.is_neox_style,
                     q_out_dtype=kv_cache_dtype,
                 )
+                print(f"[forward_absorb_core] After fused_qk_rope_cat_and_cache_mla: q={q.shape}/{q.dtype}, k={k.shape}/{k.dtype}")
 
                 save_kv_cache = False
             else:
+                print(f"[forward_absorb_core] Sub-path: Standard (torch.cat)")
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
+                print(f"[forward_absorb_core] After torch.cat: q={q.shape}/{q.dtype}, k={k.shape}/{k.dtype}")
 
             # Apply llama 4 scaling if provided
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
+
+            print(f"[forward_absorb_core] Final Q before attn_mqa: shape={q.shape}, dtype={q.dtype}")
+            print(f"[forward_absorb_core] Final K before attn_mqa: shape={k.shape}, dtype={k.dtype}")
+            print(f"[forward_absorb_core] Calling attn_mqa (save_kv_cache={save_kv_cache})")
 
             attn_output = self.attn_mqa(
                 q,

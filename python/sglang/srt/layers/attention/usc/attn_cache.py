@@ -18,125 +18,125 @@ import triton.language as tl
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-@triton.jit
-def _fused_predicted_qk_kernel(
-    q_ptr,          # [s_q, h_q, d_qk]  bf16/fp16
-    kv_pool_ptr,    # [pool_size, 1, d_qk]  bf16/fp16
-    indices_ptr,    # [s_q, topk]  int64/int32
-    out_ptr,        # [s_q, h_q, topk]  fp32
-    s_q, h_q, topk, d_qk, pool_sz,
-    stride_q_s, stride_q_h, stride_q_d,
-    stride_kv_slot, stride_kv_d,
-    stride_o_s, stride_o_h, stride_o_k,
-    BLOCK_SQ: tl.constexpr,    # query tokens per program
-    BLOCK_K: tl.constexpr,     # topk slots per inner tile
-    BLOCK_H: tl.constexpr,     # heads per inner tile
-    D_BLOCK: tl.constexpr,     # reduction tile over d_qk
-):
-    """Fused gather + Q@K^T + invalid-mask for sparse predicted-QK scores.
+# @triton.jit
+# def _fused_predicted_qk_kernel(
+#     q_ptr,          # [s_q, h_q, d_qk]  bf16/fp16
+#     kv_pool_ptr,    # [pool_size, 1, d_qk]  bf16/fp16
+#     indices_ptr,    # [s_q, topk]  int64/int32
+#     out_ptr,        # [s_q, h_q, topk]  fp32
+#     s_q, h_q, topk, d_qk, pool_sz,
+#     stride_q_s, stride_q_h, stride_q_d,
+#     stride_kv_slot, stride_kv_d,
+#     stride_o_s, stride_o_h, stride_o_k,
+#     BLOCK_SQ: tl.constexpr,    # query tokens per program
+#     BLOCK_K: tl.constexpr,     # topk slots per inner tile
+#     BLOCK_H: tl.constexpr,     # heads per inner tile
+#     D_BLOCK: tl.constexpr,     # reduction tile over d_qk
+# ):
+#     """Fused gather + Q@K^T + invalid-mask for sparse predicted-QK scores.
 
-    Grid: (ceil(s_q / BLOCK_SQ),)   -- **1-D grid**.
-    h_q and topk are processed as inner loops inside the program.
+#     Grid: (ceil(s_q / BLOCK_SQ),)   -- **1-D grid**.
+#     h_q and topk are processed as inner loops inside the program.
 
-    Designed for H20 (78 SMs): small grid (e.g. 64 programs with
-    BLOCK_SQ=4, s_q=256) leaves ~14 free SMs for concurrent main-stream
-    kernels (op_usc_topk), enabling true dual-stream overlap.
+#     Designed for H20 (78 SMs): small grid (e.g. 64 programs with
+#     BLOCK_SQ=4, s_q=256) leaves ~14 free SMs for concurrent main-stream
+#     kernels (op_usc_topk), enabling true dual-stream overlap.
 
-    K vectors gathered for a (token, topk-block) are reused across all
-    head-block iterations → good L2 locality.
-    """
-    pid = tl.program_id(0)
+#     K vectors gathered for a (token, topk-block) are reused across all
+#     head-block iterations → good L2 locality.
+#     """
+#     pid = tl.program_id(0)
 
-    for sq_off in range(BLOCK_SQ):
-        pid_s = pid * BLOCK_SQ + sq_off
-        if pid_s < s_q:
-            # ---- topk block loop ----
-            for k_start in range(0, topk, BLOCK_K):
-                k_offs = k_start + tl.arange(0, BLOCK_K)
-                k_mask = k_offs < topk
+#     for sq_off in range(BLOCK_SQ):
+#         pid_s = pid * BLOCK_SQ + sq_off
+#         if pid_s < s_q:
+#             # ---- topk block loop ----
+#             for k_start in range(0, topk, BLOCK_K):
+#                 k_offs = k_start + tl.arange(0, BLOCK_K)
+#                 k_mask = k_offs < topk
 
-                # Load & clamp indices [BLOCK_K]
-                idx_raw = tl.load(indices_ptr + pid_s * topk + k_offs,
-                                    mask=k_mask, other=-1)
-                valid = idx_raw >= 0
-                safe_idx = tl.where(valid, idx_raw, tl.zeros_like(idx_raw))
-                safe_idx = tl.where(safe_idx < pool_sz, safe_idx, pool_sz - 1)
+#                 # Load & clamp indices [BLOCK_K]
+#                 idx_raw = tl.load(indices_ptr + pid_s * topk + k_offs,
+#                                     mask=k_mask, other=-1)
+#                 valid = idx_raw >= 0
+#                 safe_idx = tl.where(valid, idx_raw, tl.zeros_like(idx_raw))
+#                 safe_idx = tl.where(safe_idx < pool_sz, safe_idx, pool_sz - 1)
 
-                # ---- head block loop (K reused across all heads) ----
-                for h_start in range(0, h_q, BLOCK_H):
-                    h_offs = h_start + tl.arange(0, BLOCK_H)
-                    h_mask = h_offs < h_q
+#                 # ---- head block loop (K reused across all heads) ----
+#                 for h_start in range(0, h_q, BLOCK_H):
+#                     h_offs = h_start + tl.arange(0, BLOCK_H)
+#                     h_mask = h_offs < h_q
 
-                    acc = tl.zeros([BLOCK_H, BLOCK_K], dtype=tl.float32)
+#                     acc = tl.zeros([BLOCK_H, BLOCK_K], dtype=tl.float32)
 
-                    # ---- d_qk reduction ----
-                    for d_start in range(0, d_qk, D_BLOCK):
-                        d_offs = d_start + tl.arange(0, D_BLOCK)
-                        d_mask = d_offs < d_qk
+#                     # ---- d_qk reduction ----
+#                     for d_start in range(0, d_qk, D_BLOCK):
+#                         d_offs = d_start + tl.arange(0, D_BLOCK)
+#                         d_mask = d_offs < d_qk
 
-                        # Q chunk: [BLOCK_H, D_BLOCK]
-                        q_ptrs = (pid_s * stride_q_s
-                                    + h_offs[:, None] * stride_q_h
-                                    + d_offs[None, :] * stride_q_d)
-                        q_chunk = tl.load(
-                            q_ptr + q_ptrs,
-                            mask=h_mask[:, None] & d_mask[None, :],
-                            other=0.0,
-                        ).to(tl.float16)
+#                         # Q chunk: [BLOCK_H, D_BLOCK]
+#                         q_ptrs = (pid_s * stride_q_s
+#                                     + h_offs[:, None] * stride_q_h
+#                                     + d_offs[None, :] * stride_q_d)
+#                         q_chunk = tl.load(
+#                             q_ptr + q_ptrs,
+#                             mask=h_mask[:, None] & d_mask[None, :],
+#                             other=0.0,
+#                         ).to(tl.float16)
 
-                        # K chunk: [BLOCK_K, D_BLOCK]  (indirect gather)
-                        kv_ptrs = (safe_idx[:, None] * stride_kv_slot
-                                    + d_offs[None, :] * stride_kv_d)
-                        k_chunk = tl.load(
-                            kv_pool_ptr + kv_ptrs,
-                            mask=k_mask[:, None] & d_mask[None, :],
-                            other=0.0,
-                        ).to(tl.float16)
+#                         # K chunk: [BLOCK_K, D_BLOCK]  (indirect gather)
+#                         kv_ptrs = (safe_idx[:, None] * stride_kv_slot
+#                                     + d_offs[None, :] * stride_kv_d)
+#                         k_chunk = tl.load(
+#                             kv_pool_ptr + kv_ptrs,
+#                             mask=k_mask[:, None] & d_mask[None, :],
+#                             other=0.0,
+#                         ).to(tl.float16)
 
-                        # [BLOCK_H, D_BLOCK] @ [D_BLOCK, BLOCK_K]
-                        acc += tl.dot(q_chunk, tl.trans(k_chunk))
+#                         # [BLOCK_H, D_BLOCK] @ [D_BLOCK, BLOCK_K]
+#                         acc += tl.dot(q_chunk, tl.trans(k_chunk))
 
-                    # Mask invalid → -inf
-                    acc = tl.where(valid[None, :], acc, float('-inf'))
+#                     # Mask invalid → -inf
+#                     acc = tl.where(valid[None, :], acc, float('-inf'))
 
-                    # Store [BLOCK_H, BLOCK_K]
-                    o_ptrs = (pid_s * stride_o_s
-                                + h_offs[:, None] * stride_o_h
-                                + k_offs[None, :] * stride_o_k)
-                    o_mask = h_mask[:, None] & k_mask[None, :]
-                    tl.store(out_ptr + o_ptrs, acc, mask=o_mask)
+#                     # Store [BLOCK_H, BLOCK_K]
+#                     o_ptrs = (pid_s * stride_o_s
+#                                 + h_offs[:, None] * stride_o_h
+#                                 + k_offs[None, :] * stride_o_k)
+#                     o_mask = h_mask[:, None] & k_mask[None, :]
+#                     tl.store(out_ptr + o_ptrs, acc, mask=o_mask)
 
-_QK_BLOCK_SQ = int(os.environ.get("USC_QK_BLOCK_SQ", "4"))
-_QK_BLOCK_K  = int(os.environ.get("USC_QK_BLOCK_K", "128"))
-_QK_BLOCK_H  = int(os.environ.get("USC_QK_BLOCK_H", "32"))
-_QK_D_BLOCK  = int(os.environ.get("USC_QK_D_BLOCK", "64"))
+# _QK_BLOCK_SQ = int(os.environ.get("USC_QK_BLOCK_SQ", "4"))
+# _QK_BLOCK_K  = int(os.environ.get("USC_QK_BLOCK_K", "128"))
+# _QK_BLOCK_H  = int(os.environ.get("USC_QK_BLOCK_H", "32"))
+# _QK_D_BLOCK  = int(os.environ.get("USC_QK_D_BLOCK", "64"))
 
-def _triton_predicted_qk(
-    q_all: torch.Tensor,       # [s_q, h_q, d_qk]
-    indices: torch.Tensor,     # [s_q, topk]
-    kv_pool: torch.Tensor,     # [pool_size, 1, d_qk]
-    out: torch.Tensor,         # [s_q, h_q, topk]  fp32
-    BLOCK_SQ: int = _QK_BLOCK_SQ,
-    BLOCK_K: int = _QK_BLOCK_K,
-    BLOCK_H: int = _QK_BLOCK_H,
-    D_BLOCK: int = _QK_D_BLOCK,
-):
-    """Python wrapper — 1-D grid launch for ``_fused_predicted_qk_kernel``."""
-    s_q, h_q, d_qk = q_all.shape
-    topk = indices.shape[-1]
-    pool_sz = kv_pool.shape[0]
+# def _triton_predicted_qk(
+#     q_all: torch.Tensor,       # [s_q, h_q, d_qk]
+#     indices: torch.Tensor,     # [s_q, topk]
+#     kv_pool: torch.Tensor,     # [pool_size, 1, d_qk]
+#     out: torch.Tensor,         # [s_q, h_q, topk]  fp32
+#     BLOCK_SQ: int = _QK_BLOCK_SQ,
+#     BLOCK_K: int = _QK_BLOCK_K,
+#     BLOCK_H: int = _QK_BLOCK_H,
+#     D_BLOCK: int = _QK_D_BLOCK,
+# ):
+#     """Python wrapper — 1-D grid launch for ``_fused_predicted_qk_kernel``."""
+#     s_q, h_q, d_qk = q_all.shape
+#     topk = indices.shape[-1]
+#     pool_sz = kv_pool.shape[0]
 
-    grid = (triton.cdiv(s_q, BLOCK_SQ),)          # 1-D grid!
-    _fused_predicted_qk_kernel[grid](
-        q_all, kv_pool, indices, out,
-        s_q, h_q, topk, d_qk, pool_sz,
-        q_all.stride(0), q_all.stride(1), q_all.stride(2),
-        kv_pool.stride(0), kv_pool.stride(2),
-        out.stride(0), out.stride(1), out.stride(2),
-        BLOCK_SQ=BLOCK_SQ, BLOCK_K=BLOCK_K,
-        BLOCK_H=BLOCK_H, D_BLOCK=D_BLOCK,
-    )
-    return out
+#     grid = (triton.cdiv(s_q, BLOCK_SQ),)          # 1-D grid!
+#     _fused_predicted_qk_kernel[grid](
+#         q_all, kv_pool, indices, out,
+#         s_q, h_q, topk, d_qk, pool_sz,
+#         q_all.stride(0), q_all.stride(1), q_all.stride(2),
+#         kv_pool.stride(0), kv_pool.stride(2),
+#         out.stride(0), out.stride(1), out.stride(2),
+#         BLOCK_SQ=BLOCK_SQ, BLOCK_K=BLOCK_K,
+#         BLOCK_H=BLOCK_H, D_BLOCK=D_BLOCK,
+#     )
+#     return out
 
 @triton.jit
 def _fused_verify_remap_kernel(
@@ -152,11 +152,6 @@ def _fused_verify_remap_kernel(
 ):
     """Fused verify (hit/miss) + remap (find position in predicted).
 
-    Replaces the _verify_cache_kernel + _remap_predicted_to_actual
-    (sort + searchsorted + gather) with a single kernel.  For each actual
-    index, vectorized-scan all predicted indices to find membership AND
-    the match position simultaneously.
-
     Grid: (N, cdiv(topk, BLOCK_A))
     """
     pid_n = tl.program_id(0)   # token row
@@ -171,7 +166,6 @@ def _fused_verify_remap_kernel(
     ).to(tl.int32)
     valid = actual >= 0
 
-    # -1 = not found (position 0 is valid, so 0 cannot be sentinel)
     found_pos = tl.zeros([BLOCK_A], dtype=tl.int32) - 1
 
     for p_start in range(0, pred_topk, BLOCK_P):
@@ -183,14 +177,11 @@ def _fused_verify_remap_kernel(
             mask=p_mask, other=-2,
         ).to(tl.int32)
 
-        # [BLOCK_A, BLOCK_P] element-wise comparison
         eq = actual[:, None] == pred[None, :]
 
-        # Only new matches — skip rows already found
         not_yet = (found_pos < 0)                       # [BLOCK_A]
         eq_new = eq & not_yet[:, None] & p_mask[None, :]  # [BLOCK_A, BLOCK_P]
 
-        # Min matching position in this chunk (sentinel = pred_topk)
         pos_vals = p_offs[None, :].to(tl.int32)           # [1, BLOCK_P]
         masked_pos = tl.where(eq_new, pos_vals, pred_topk)
         min_pos = tl.min(masked_pos, axis=1)               # [BLOCK_A]
@@ -207,49 +198,43 @@ def _fused_verify_remap_kernel(
     tl.store(remap_ptr + pid_n * topk + a_offs, remap_val,        mask=a_mask)
 
 
-def _fused_verify_remap(
-    actual_indices: torch.Tensor,      # [N, topk]
-    predicted_indices: torch.Tensor,   # [N, pred_topk]
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused verify + remap.  1 kernel, no sort / searchsorted.
+# def _fused_verify_remap(
+#     actual_indices: torch.Tensor,      # [N, topk]
+#     predicted_indices: torch.Tensor,   # [N, pred_topk]
+# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#     """Fused verify + remap.  1 kernel, no sort / searchsorted.
 
-    Returns:
-        hit_mask:  [N, topk] int8  (1=hit, 0=not-hit — same memory layout as bool)
-        miss_mask: [N, topk] int8  (1=miss, 0=not-miss)
-        remap_pos: [N, topk] int32 (position in predicted for hits, 0 otherwise)
-    """
-    N, topk = actual_indices.shape
-    pred_topk = predicted_indices.shape[-1]
-    device = actual_indices.device
+#     Returns:
+#         hit_mask:  [N, topk] int8  (1=hit, 0=not-hit — same memory layout as bool)
+#         miss_mask: [N, topk] int8  (1=miss, 0=not-miss)
+#         remap_pos: [N, topk] int32 (position in predicted for hits, 0 otherwise)
+#     """
+#     N, topk = actual_indices.shape
+#     pred_topk = predicted_indices.shape[-1]
+#     device = actual_indices.device
 
-    hit_raw   = torch.empty(N, topk, dtype=torch.int8,  device=device)
-    miss_raw  = torch.empty(N, topk, dtype=torch.int8,  device=device)
-    remap_pos = torch.empty(N, topk, dtype=torch.int32, device=device)
+#     hit_raw   = torch.empty(N, topk, dtype=torch.int8,  device=device)
+#     miss_raw  = torch.empty(N, topk, dtype=torch.int8,  device=device)
+#     remap_pos = torch.empty(N, topk, dtype=torch.int32, device=device)
 
-    BLOCK_A = 64
-    BLOCK_P = 64
-    grid = (N, triton.cdiv(topk, BLOCK_A))
+#     BLOCK_A = 64
+#     BLOCK_P = 64
+#     grid = (N, triton.cdiv(topk, BLOCK_A))
 
-    # Pass strides instead of calling .contiguous() — the kernel uses
-    # stride-based addressing, and actual/predicted are typically contiguous
-    # from the indexer.  Avoids a redundant aten::copy_ when they happen
-    # to be non-contiguous.
-    _fused_verify_remap_kernel[grid](
-        actual_indices,
-        predicted_indices,
-        hit_raw, miss_raw, remap_pos,
-        topk, pred_topk,
-        actual_indices.stride(0), predicted_indices.stride(0),
-        BLOCK_A=BLOCK_A, BLOCK_P=BLOCK_P,
-    )
-    # Return int8 directly — no .bool() conversion.
-    return hit_raw, miss_raw, remap_pos
-
-
-# ------------------------------------------------------------------ #
-#  Fused partition + prepare: cumsum-based binary partition replaces  #
-#  _compute_sort_key + torch.sort + _fused_prepare_all               #
-# ------------------------------------------------------------------ #
+#     # Pass strides instead of calling .contiguous() — the kernel uses
+#     # stride-based addressing, and actual/predicted are typically contiguous
+#     # from the indexer.  Avoids a redundant aten::copy_ when they happen
+#     # to be non-contiguous.
+#     _fused_verify_remap_kernel[grid](
+#         actual_indices,
+#         predicted_indices,
+#         hit_raw, miss_raw, remap_pos,
+#         topk, pred_topk,
+#         actual_indices.stride(0), predicted_indices.stride(0),
+#         BLOCK_A=BLOCK_A, BLOCK_P=BLOCK_P,
+#     )
+#     # Return int8 directly — no .bool() conversion.
+#     return hit_raw, miss_raw, remap_pos
 
 @triton.jit
 def _fused_partition_and_prepare_kernel(
@@ -257,12 +242,12 @@ def _fused_partition_and_prepare_kernel(
     actual_ptr,           # [s_q, topk] int64
     hit_mask_ptr,         # [s_q, topk] int8
     remap_ptr,            # [s_q, topk] int32
-    predicted_qk_ptr,     # [s_q, h_q, pred_topk] f32
+    predicted_qk_ptr,     # [s_q, h_q, pred_topk] 
     q_all_ptr,            # [s_q, h_q, d_qk] bf16
     # Outputs — topk buffers
     idx_out_ptr,          # [s_q, 1, topk_padded] int32
     hit_out_ptr,          # [s_q, 1, topk_padded] int32
-    qk_out_ptr,           # [s_q, h_padded, topk_padded] f32
+    qk_out_ptr,           # [s_q, h_padded, topk_padded] 
     # Output — q buffer
     q_out_ptr,            # [s_q, h_padded, d_qk] bf16
     # Dimensions
@@ -294,18 +279,6 @@ def _fused_partition_and_prepare_kernel(
     pid_b = tl.program_id(1)
 
     if pid_b == 0:
-        # ============================================================
-        # PARTITION + SCATTER-WRITE to idx_buf, hit_buf, qk_buf
-        #
-        # All topk positions are classified by hit_mask alone:
-        #   hit=0 → miss,  hit=1 → hit.
-        #
-        # Layout:
-        #   [miss₀ … miss_{n-1} | hit₀ … hit_{m-1} | padding]
-        #    n_miss + n_hit = topk    only if topk % 128 ≠ 0 ↑
-        #
-        # qk_buf scatter-written for HIT positions ONLY.
-        # ============================================================
         k_offs    = tl.arange(0, BLOCK_TOPK)
         in_data   = k_offs < topk
         in_padded = k_offs < topk_padded
@@ -368,13 +341,6 @@ def _fused_partition_and_prepare_kernel(
             tl.full([BLOCK_TOPK], 1, dtype=tl.int32),
             mask=is_padding,
         )
-
-        # ---- Scatter-write qk_buf — HIT positions ONLY ----
-        # miss positions: qk_buf stays 0 (pre-zeroed) — correct because
-        #   the CUDA kernel's merge_hit_qk only reads when is_hit=true.
-        # Stale values at non-hit positions are harmless:
-        #   - merge_hit_qk checks is_hit first → miss never read
-        #   - load_all_predicted_qk reads all, but mask_rP → -∞ for invalid
         if HAS_HIT:
             remap = tl.load(
                 remap_ptr + pid_s * stride_remap_row + k_offs,
@@ -394,9 +360,6 @@ def _fused_partition_and_prepare_kernel(
                     qk_val, mask=is_hit,
                 )
     else:
-        # ============================================================
-        # D_QK PATH — copy q_all → q_buf (H_Q data heads only)
-        # ============================================================
         d_idx  = pid_b - 1
         d_offs = d_idx * BLOCK_D + tl.arange(0, BLOCK_D)
         d_mask = d_offs < d_qk
@@ -413,7 +376,6 @@ def _fused_partition_and_prepare_kernel(
                 q_out_ptr + qout_base + h * stride_qout_h + d_offs,
                 val, mask=d_mask,
             )
-        # NOTE: q_buf[h>=H_Q] is pre-zeroed.
 
 
 def _fused_partition_and_prepare(
@@ -433,26 +395,13 @@ def _fused_partition_and_prepare(
     skip_q_copy: bool = False,
 ):
     """Single kernel: binary partition (miss-first) + write + q_buf copy.
-
-    Replaces ``_compute_sort_key`` + ``torch.sort`` + ``_fused_prepare_all``
-    with one Triton launch.  The partition is computed via ``tl.cumsum``
-    inside the kernel — no external sort, no perm tensor, no
-    cudaMemcpyAsync.
-
-    Requires qk_buf and q_buf to be zero-initialized at allocation.
-    Padding-head regions (h >= h_q) are never written by this kernel.
-
-    Args:
-        skip_q_copy: If True, skip the q_all → q_buf copy (assumes q_all is already aligned)
     """
     s_q = actual_indices.shape[0]
     BLOCK_TOPK = triton.next_power_of_2(topk_padded)
 
-    # Choose num_warps: more warps for larger BLOCK_TOPK
     num_warps = max(4, min(BLOCK_TOPK // 64, 16))
 
     if skip_q_copy:
-        # Only run partition programs (pid_b == 0), skip q-copy programs
         grid = (s_q, 1)
         BLOCK_D = 128  # Not used but needed for kernel signature
     else:
@@ -653,10 +602,6 @@ class USCSparseAttnCache:
                 f"sq={alloc_sq} topk_padded={topk_padded}"
             )
 
-        # qk buffer — can be large.
-        # ZERO-initialized: the write kernel only fills H_Q data heads,
-        # relying on the padding region (h >= h_q) being permanently zero.
-        # _sparse_merge_fwd only READS qk_buf, so zeros persist.
         if (
             cls._shared_mr_qk_buf is None
             or cls._shared_mr_qk_buf.shape[0] < s_q
@@ -672,7 +617,6 @@ class USCSparseAttnCache:
                 f"({cls._shared_mr_qk_buf.nelement() * 4 / 1024 / 1024:.0f} MB)"
             )
 
-        # q buffer — only allocate if needed (when h_q requires padding)
         if not skip_q_buf:
             if (
                 cls._shared_mr_q_buf is None
@@ -1473,22 +1417,12 @@ class USCSparseAttnCache:
         zero_allocator,
         kv_pool: torch.Tensor,
     ) -> torch.Tensor:
-        """Optimised miss-reduce: fused Triton kernels with eliminated intermediate buffers.
-
-        Optimizations:
-        1. Eliminates intermediate hit_mask/remap_pos buffers by computing them on-demand
-        2. Skips q_buf copy when h_q is already aligned (h_q % 64 == 0)
-
-        The miss-first ordering is **required** by the CUDA merge kernel's
-        ``is_block_all_hit(block_start)`` optimisation.
-        """
         s_q, h_q, d_qk = q_all.shape
         kv_lora_rank = attn_module.kv_lora_rank
         device = q_all.device
         topk = actual_indices.shape[-1]
         pool_sz = kv_pool.shape[0]
 
-        # ---- Kernel alignment (pure Python, zero GPU ops) ----
         B_TOPK_2 = 128
         B_H = 64
         topk_padded = ((topk + B_TOPK_2 - 1) // B_TOPK_2) * B_TOPK_2
