@@ -1586,7 +1586,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         state.attn_predicted_qk = (
             self.usc_attn_cache.compute_qk_scores(
-                q_all, predicted_indices, sm_scale, kv_pool,
+                q_all, predicted_indices, kv_pool,
                 qk_buf=qk_buf,
             )
         )
@@ -1628,6 +1628,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         actual_indices = state.get("attn_actual_sparse_index")  # kept for estimate_a
         predicted_qk = state.pop("attn_predicted_qk")
         predicted_indices = state.pop("_usc_predicted_indices")
+        # predicted_indices = state.pop("attn_estimated_sparse_index")
         intermediate_state = state.pop("usc_attn_intermediate")
 
         if q_all is not None and kv_pool is not None and actual_indices is not None:

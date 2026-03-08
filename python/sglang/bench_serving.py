@@ -2004,6 +2004,21 @@ def calculate_metrics(
             output_lens.append(0)
             retokenized_output_lens.append(0)
 
+    # Print per-request TTFT for prefix cache analysis
+    if len(ttfts) > 0:
+        print("\n" + "=" * 50)
+        print("[Per-Request TTFT for Prefix Cache Analysis]")
+        for i, t in enumerate(ttfts):
+            marker = ""
+            if i == 0:
+                marker = " <-- First request (no cache)"
+            elif i < 4:
+                marker = " <-- Concurrent batch (no cache)"
+            else:
+                marker = " <-- Should hit cache"
+            print(f"  Request {i+1:2d}: {t*1000:8.2f} ms{marker}")
+        print("=" * 50)
+
     if completed == 0:
         warnings.warn(
             "All requests failed. This is likely due to a misconfiguration "

@@ -179,16 +179,17 @@ def _compute_attn_usc_prefill(layer):
         tbo_delta_stages=0,
         operations=[
             layer.op_usc_comm_prepare_attn,
+
             layer.self_attn.op_usc_estimate_b, 
             layer.self_attn.op_usc_prepare, 
             layer.self_attn.op_usc_hit_a,        
-            layer.self_attn.op_usc_topk,        
-            # layer.self_attn.op_usc_verify,     
+            layer.self_attn.op_usc_topk,         
             layer.self_attn.op_usc_hit_b,       
             layer.self_attn.op_usc_miss_reduce,     
             layer.self_attn.op_usc_estimate_a, 
             # layer.self_attn.op_prepare,
             # layer.self_attn.op_core,
+
             layer.op_usc_comm_prepare_mlp,
             
             layer.mlp.op_usc_normal,
