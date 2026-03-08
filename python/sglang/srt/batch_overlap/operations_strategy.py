@@ -81,7 +81,10 @@ def _compute_moe_deepseek_layer_operations_strategy_tbo(
 ) -> OperationsStrategy:
     assert layer.is_layer_sparse, "dense layer TBO not yet implemented"
     if forward_mode == ForwardMode.EXTEND:
-        return _compute_moe_deepseek_blog_prefill(layer)
+        if is_usc_enabled():
+            return _compute_ep_moe_usc_prefill(layer)
+        else:
+            return _compute_moe_deepseek_blog_prefill(layer)
     elif (
         forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
     ):
@@ -155,15 +158,16 @@ def _compute_moe_usc_layer_operations_strategy_tbo(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
 ) -> OperationsStrategy:
+    from sglang.srt.layers.moe import get_moe_a2a_backend
     assert layer.is_layer_sparse, "dense layer TBO not yet implemented"
     if forward_mode == ForwardMode.EXTEND:
-        assert False, "DeepSeek V3.2 Unified Sparse Cache prefill brings negative performance"
-        return _compute_moe_usc_decode(layer)
+        if get_moe_a2a_backend().is_deepep():
+            return _compute_ep_moe_usc_prefill(layer)
+        else:
+            assert NotImplementedError("Unsupported prefill strategy for non-DeepEP backend")
     elif (
         forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
     ):
-        from sglang.srt.layers.moe import get_moe_a2a_backend
-        # TODO: with attn, this prefill strategy might not be applicable to decode
         if get_moe_a2a_backend().is_deepep():
             return _compute_ep_moe_usc_decode(layer)
         else:
@@ -190,6 +194,7 @@ def _compute_moe_usc_decode(layer):
 
             layer.mlp.op_usc_hit_a,  # overlap hit forward with op_gate+op_select_experts
 
+            layer.mlp.op_usc_shared_experts,
             layer.mlp.op_usc_topk,
             
             layer.mlp.op_usc_verify, # sync: use true and estimated topk
@@ -229,14 +234,14 @@ def _compute_ep_moe_usc_decode(layer):
             # layer.mlp.op_usc_verify,
 
             # # hit: MoE calculation | miss: dispatch
-            # layer.mlp.op_usc_ep_miss_dispatch_a,
             # layer.mlp.op_usc_ep_hit_dispatch_b,
+            # layer.mlp.op_usc_ep_miss_dispatch_a,
             # layer.mlp.op_usc_ep_hit_expert_a,
             
             # # hit: combine | miss: MoE calculation
             # layer.mlp.op_usc_ep_hit_expert_b,
-            # layer.mlp.op_usc_ep_hit_combine_a,
             # layer.mlp.op_usc_ep_miss_dispatch_b,
+            # layer.mlp.op_usc_ep_hit_combine_a,
             # layer.mlp.op_usc_ep_miss_expert_a,
 
             # # hit: next topk | miss: combine
@@ -246,12 +251,64 @@ def _compute_ep_moe_usc_decode(layer):
             # layer.mlp.op_usc_estimate_a,
 
             # # reduce hit and miss results
+            # layer.mlp.op_usc_ep_shared_experts_a,
+            # layer.mlp.op_usc_ep_shared_experts_b,
             # layer.mlp.op_usc_ep_miss_combine_b,
             # layer.mlp.op_usc_output,
 
-            layer.mlp.op_usc_ep_forward,
+            layer.mlp.op_usc_ep_decode,
 
             layer.op_usc_comm_postprocess_layer,
+        ],
+    )
+
+def _compute_ep_moe_usc_prefill(layer):
+    device_properties = torch.cuda.get_device_properties(device="cuda")
+    total_num_sms = device_properties.multi_processor_count
+    deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+
+    return OperationsStrategy(
+        deep_gemm_num_sms=deep_gemm_num_sms,
+        tbo_delta_stages=0,
+        operations=[
+            layer.op_usc_comm_prepare_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
+            layer.op_usc_comm_prepare_mlp,
+
+            operations.YieldOperation(),
+
+            layer.mlp.op_usc_estimate_b,
+
+            layer.mlp.op_usc_ep_hit_dispatch_a,
+            layer.mlp.op_usc_topk,
+            layer.mlp.op_usc_verify,
+            layer.mlp.op_usc_ep_hit_dispatch_b,
+
+            layer.mlp.op_usc_ep_miss_dispatch_a,
+            layer.mlp.op_usc_ep_hit_expert_a,
+            layer.mlp.op_usc_ep_miss_dispatch_b,
+            layer.mlp.op_usc_ep_hit_expert_b,
+
+            layer.mlp.op_usc_ep_hit_combine_a,
+            layer.mlp.op_usc_ep_miss_expert_a,
+            layer.mlp.op_usc_ep_hit_combine_b,
+            layer.mlp.op_usc_ep_miss_expert_b,
+
+            layer.mlp.op_usc_ep_miss_combine_a,
+            layer.mlp.op_usc_ep_shared_experts_a,
+            layer.mlp.op_usc_ep_miss_combine_b,
+            layer.mlp.op_usc_ep_shared_experts_b,
+
+            layer.mlp.op_usc_output,
+
+            layer.mlp.op_usc_estimate_a,
+
+            # layer.mlp.op_usc_ep_prefill,
+
+            layer.op_usc_comm_postprocess_layer,    
+
+            operations.YieldOperation(),
         ],
     )
 

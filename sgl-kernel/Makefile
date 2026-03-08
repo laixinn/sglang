@@ -42,7 +42,7 @@ build: install-deps submodule ## Build and install wheel package
 		CMAKE_BUILD_PARALLEL_LEVEL=$(CMAKE_BUILD_PARALLEL_LEVEL) \
 		CMAKE_ARGS="$(CMAKE_ARGS)" \
 		uv build --wheel -Cbuild-dir=$(UV_BUILD_DIR) . --verbose --color=always --no-build-isolation && \
-		pip3 install dist/*whl --force-reinstall --no-deps
+		uv pip install dist/*whl --force-reinstall --no-deps
 
 clean: ## Remove build artifacts
 	@rm -rf build dist *.egg-info

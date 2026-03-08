@@ -401,10 +401,6 @@ class ForwardBatch:
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # For USC
-    usc_hit_count: int = 0
-    usc_total_count: int = 0
-
     @classmethod
     def init_new(
         cls,

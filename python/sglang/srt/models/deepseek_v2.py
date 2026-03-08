@@ -1086,29 +1086,41 @@ class DeepseekV2MoE(nn.Module):
         if (estimate_event := state.pop("estimate_event")) is not None:
             state.estimated_topk = self.usc_cache.index_estimate_b(estimate_event)
         else:
-            state.estimated_topk = self.topk.full_topk_output(
-                state.hidden_states_mlp_input.device, state.hidden_states_mlp_input.shape[0], True)
+            if state.forward_batch.forward_mode.is_decode() or state.forward_batch.forward_mode.is_target_verify():
+                state.estimated_topk = self.topk.full_topk_output(
+                    state.hidden_states_mlp_input.device, state.hidden_states_mlp_input.shape[0], True)
+            else:
+                state.estimated_topk = None
+
+    def op_usc_shared_experts(self, state):
+        state.shared_output = self.usc_cache.forward_shared_experts(
+            self._forward_shared_experts,
+            state.hidden_states_mlp_input,
+            self._fuse_shared_experts_inside_sbo,
+        )
 
     def op_usc_topk(self, state):
         if state.hidden_states_mlp_input.shape[0] > 0:
-            if (
-                not self._fuse_shared_experts_inside_sbo
-            ):  # TODO: check if it supports mtp
-                state.shared_output = self._forward_shared_experts(
-                    state.hidden_states_mlp_input, None
-                )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(state.hidden_states_mlp_input)
             state.topk_output = self.topk(state.hidden_states_mlp_input, router_logits)
         else:
-            state.topk_output = self.topk.full_topk_output(
-                state.hidden_states_mlp_input.device, state.hidden_states_mlp_input.shape[0], True)
+            if state.forward_batch.forward_mode.is_decode() or state.forward_batch.forward_mode.is_target_verify():
+                state.topk_output = self.topk.full_topk_output(
+                    state.hidden_states_mlp_input.device, state.hidden_states_mlp_input.shape[0], True)
+            else:
+                state.topk_output = self.topk.empty_topk_output(state.hidden_states_mlp_input.device)
 
     def op_usc_verify(self, state):
         # For first layer, estimated_topk is all -1 and hit_mask is all False
         state.hit_mask, state.miss_mask = self.usc_cache._verify_cache(
             state.topk_output, state.estimated_topk
         )
+
+        # hit_rate = (hit_mask.sum() / hit_mask.numel()) > 0.5
+        # state.hit_mask = hit_rate * hit_mask + (~hit_rate) * torch.zeros_like(hit_mask)
+        # state.miss_mask = hit_rate * miss_mask + (~hit_rate) * torch.ones_like(miss_mask)
+        # state.hit_rate = hit_rate
         
     def op_usc_hit_a(self, state):
         state.estimated_topk.topk_weights.fill_(1.0)
@@ -1138,7 +1150,7 @@ class DeepseekV2MoE(nn.Module):
             state.pop("miss_varlen_combine_output"),
             state.pop("hit_mask"),
             state.pop("miss_mask"),
-            self.routed_scaling_factor,
+            1.0,
             state.pop("estimated_topk"),
             state.pop("topk_output"),
         )
@@ -1179,68 +1191,125 @@ class DeepseekV2MoE(nn.Module):
         return estimated_topk
 
     # EP operations
-    # reused operations: op_usc_estimate_a, op_usc_estimate_b, op_usc_topk, usc_index_estimate, op_usc_verify
-    def op_usc_ep_forward(self, state):
+    # reused operations: op_usc_estimate_a, op_usc_estimate_b, 
+    # op_usc_topk, usc_index_estimate, op_usc_verify, op_usc_shared_experts
+    def op_usc_ep_decode(self, state):
         self.op_usc_estimate_b(state)
 
+        def _fn1():
+            self.op_usc_topk(state)
+            self.op_usc_verify(state)
+        _fn1_event = self.usc_cache._async_execute(_fn1)
         self.op_usc_ep_hit_dispatch_a(state)
-        self.op_usc_ep_hit_dispatch_b(state)
         
-        self.op_usc_topk(state)
-        self.op_usc_verify(state)
-
-        self.op_usc_ep_miss_dispatch_a(state)
-        self.op_usc_ep_miss_dispatch_b(state)
+        _fn1_event.get_tensor()
+        self.op_usc_ep_hit_dispatch_b(state)
 
         self.op_usc_ep_hit_expert_a(state)
-        self.op_usc_ep_hit_expert_b(state)
+        self.op_usc_ep_miss_dispatch_a(state)
 
+        self.op_usc_ep_hit_expert_b(state)
+        self.op_usc_ep_miss_dispatch_b(state)
+        
+        self.op_usc_ep_miss_expert_a(state)
         self.op_usc_ep_hit_combine_a(state)
+        
+        self.op_usc_ep_miss_expert_b(state)
         self.op_usc_ep_hit_combine_b(state)
 
-        self.op_usc_ep_miss_expert_a(state)
-        self.op_usc_ep_miss_expert_b(state)
-
+        self.op_usc_ep_shared_experts_a(state)
         self.op_usc_ep_miss_combine_a(state)
+        
+        self.op_usc_ep_shared_experts_b(state)
         self.op_usc_ep_miss_combine_b(state)
+        self.op_usc_output(state)
 
         self.op_usc_estimate_a(state)
 
+    def op_usc_ep_prefill(self, state):
+        self.op_usc_estimate_b(state)
+
+        def _fn1():
+            self.op_usc_topk(state)
+            self.op_usc_verify(state)
+        self.op_usc_ep_hit_dispatch_a(state)
+        _fn1_event = self.usc_cache._async_execute(_fn1)
+        self.op_usc_ep_hit_dispatch_b(state)
+        _fn1_event.get_tensor()
+
+        self.op_usc_ep_miss_dispatch_a(state)
+        self.op_usc_ep_hit_expert_a(state)
+        self.op_usc_ep_miss_dispatch_b(state)
+        self.op_usc_ep_hit_expert_b(state)
+
+        self.op_usc_ep_hit_combine_a(state)
+        self.op_usc_ep_miss_expert_a(state)
+        self.op_usc_ep_hit_combine_b(state)
+        self.op_usc_ep_miss_expert_b(state)
+
+        self.op_usc_ep_miss_combine_a(state)
+        self.op_usc_ep_shared_experts_a(state)
+        self.op_usc_ep_miss_combine_b(state)
+        self.op_usc_ep_shared_experts_b(state)
+
         self.op_usc_output(state)
 
+        self.op_usc_estimate_a(state)
+
+    def op_usc_ep_shared_experts_a(self, state):
+        state.shared_output = self.usc_cache.forward_shared_experts_a(
+            self._forward_shared_experts,
+            state.hidden_states_mlp_input,
+            self._fuse_shared_experts_inside_sbo,
+        )
+
+    def op_usc_ep_shared_experts_b(self, state):
+        state.shared_output = self.usc_cache.forward_shared_experts_b(
+            state.pop("shared_output")
+        )
 
     def op_usc_ep_hit_dispatch_a(self, state):
-        state.estimated_topk.topk_weights.fill_(1.0)
+        if state.estimated_topk is not None:
+            state.estimated_topk.topk_weights.fill_(1.0)
 
-        self.usc_cache.hit_dispatch_a(
-            hidden_states=state.hidden_states_mlp_input,
-            estimated_topk=state.estimated_topk,
-        )
+            self.usc_cache.hit_dispatch_a(
+                hidden_states=state.hidden_states_mlp_input,
+                estimated_topk=state.estimated_topk,
+            )
 
     def op_usc_ep_hit_dispatch_b(self, state):
-        state.hit_varlen_dispatch_output = self.usc_cache.hit_dispatch_b()
+        if state.estimated_topk is not None:
+            state.hit_varlen_dispatch_output = self.usc_cache.hit_dispatch_b()
 
     def op_usc_ep_hit_expert_a(self, state):
-        state.hit_varlen_expert_output = self.usc_cache.forward_expert_a(
-            state.pop("hit_varlen_dispatch_output")
-        )
+        if state.estimated_topk is not None:
+            state.hit_varlen_expert_output = self.usc_cache.forward_expert_a(
+                state.pop("hit_varlen_dispatch_output"),
+            )
 
     def op_usc_ep_hit_expert_b(self, state):
-        state.hit_varlen_expert_output = self.usc_cache.forward_expert_b(
-            state.pop("hit_varlen_expert_output")
-        )
+        if state.estimated_topk is not None:
+            state.hit_varlen_expert_output = self.usc_cache.forward_expert_b(
+                state.pop("hit_varlen_expert_output")
+            )
 
     def op_usc_ep_hit_combine_a(self, state):
-        self.usc_cache.hit_combine_a(
-            state.pop("hit_varlen_expert_output"),
-            state.pop("hit_mask"),
-            state.pop("miss_mask"),
-            state.pop("estimated_topk"),
-            state.pop("topk_output"),
-        )
+        if state.estimated_topk is not None:
+            self.usc_cache.hit_combine_a(
+                state.pop("hit_varlen_expert_output"),
+                state.pop("hit_mask"),
+                state.pop("miss_mask"),
+                state.estimated_topk,
+                state.pop("topk_output"),
+            )
+        else:
+            state.pop("hit_mask")
+            state.pop("miss_mask")
+            state.pop("topk_output")
 
     def op_usc_ep_hit_combine_b(self, state):
-        state.hit_varlen_combine_output = self.usc_cache.hit_combine_b()
+        if state.estimated_topk is not None:
+            state.hit_varlen_combine_output = self.usc_cache.hit_combine_b()
 
     def op_usc_ep_miss_dispatch_a(self, state):
         self.usc_cache.miss_dispatch_a(
@@ -1270,7 +1339,10 @@ class DeepseekV2MoE(nn.Module):
     def op_usc_ep_miss_combine_b(self, state):
         miss_varlen_combine_output = self.usc_cache.miss_combine_b()
 
-        state.hidden_states_after_combine = miss_varlen_combine_output + state.pop("hit_varlen_combine_output")
+        if state.pop("estimated_topk") is not None:
+            state.hidden_states_after_combine = miss_varlen_combine_output + state.pop("hit_varlen_combine_output")
+        else:
+            state.hidden_states_after_combine = miss_varlen_combine_output
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -3122,7 +3194,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.forward_batch
         )
         # fused moe is inplace
-        state.hidden_states_for_estimate = state.hidden_states_mlp_input.clone()
+        if get_moe_a2a_backend().is_deepep():
+            state.hidden_states_for_estimate = state.hidden_states_mlp_input
+        else:
+            state.hidden_states_for_estimate = state.hidden_states_mlp_input.clone()
 
     def op_usc_comm_prepare_attn(
         self,
@@ -3384,7 +3459,7 @@ class DeepseekV2Model(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo or (is_usc_enabled() and (forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_target_verify())):
+        if forward_batch.can_run_tbo or (is_usc_enabled() and (forward_batch.forward_mode.is_prefill() or forward_batch.forward_mode.is_target_verify())):
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer

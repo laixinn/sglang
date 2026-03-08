@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Optional, Dict, Any, Callable, Tuple
 from contextlib import contextmanager
@@ -9,16 +10,13 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPDispatcher
-from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.usc.decode_cache import DecodeCache
-
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe_post_sum
-from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sgl_kernel import moe_usc_hit_replace
+from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig, DeepEPLLDispatchOutput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import (
@@ -378,6 +376,13 @@ class USCTPMoECache(DecodeCache):
         # reduce
         return hit_results + miss_varlen_combine_output
 
+    def forward_shared_experts(self, _fn: Callable, hidden_states: torch.Tensor, flag: bool):
+        if not flag:
+            ret = _fn(hidden_states, None)
+        else:
+            ret = None
+        return ret
+
 
 class USCEPMoECache(DecodeCache):
     def __init__(self, experts):
@@ -391,7 +396,43 @@ class USCEPMoECache(DecodeCache):
         self.alt_event0 = torch.cuda.Event()
         self.alt_event1 = torch.cuda.Event()
 
-    def _async_execute(self, fn: Callable):
+        self.compute_num_sms = None
+        self.communicate_num_sms = None
+
+        self.update_overlap_args()
+
+    def update_overlap_args(self, num_sms: Optional[int] = None, tbo_index: Optional[int] = None):
+        if num_sms is None:
+            num_sms = DeepEPConfig.get_instance().num_sms
+        # combine overlap args
+        self.compute_num_sms, self.communicate_num_sms = self._compute_usc_overlap_args(num_sms)
+        meta_overlap_args = dict(
+            dispatch_num_sms=self.communicate_num_sms,
+            combine_num_sms=self.communicate_num_sms,
+        )
+        self.experts.dispatcher.set_overlap_args(
+            None, 
+            meta_overlap_args,
+            tbo_index,
+        )
+
+    def clean_overlap_args(self):
+        self.experts.dispatcher.clear_overlap_args()
+        self.compute_num_sms = None
+        self.communicate_num_sms = None
+        
+    def _compute_usc_overlap_args(self, communicate_num_sms):
+        total_num_sms = torch.cuda.get_device_properties(
+            device="cuda"
+        ).multi_processor_count
+
+        # hit and miss communication
+        assert communicate_num_sms <= total_num_sms
+        compute_num_sms = total_num_sms - communicate_num_sms
+
+        return compute_num_sms, communicate_num_sms
+
+    def _async_execute(self, fn: Callable, sync: bool = False):
         self.alt_event0.record()
         with torch.cuda.stream(self.alt_stream):
             self.alt_event0.wait()
@@ -400,7 +441,7 @@ class USCEPMoECache(DecodeCache):
         return StreamTensorWrapper(
             result,
             self.alt_event1,
-            sync=True,
+            sync=sync,
         )
 
     def index_estimate_a(
@@ -417,16 +458,36 @@ class USCEPMoECache(DecodeCache):
     
     def forward_expert_a(self, dispatch_output):
         def _fn():
-            return self.experts.run_moe_core(
+            # ctx = nullcontext()
+            # if self.compute_num_sms is not None:
+            #     ctx = deep_gemm_wrapper.configure_deep_gemm_num_sms(self.compute_num_sms)
+            # with ctx:
+            ret = self.experts.run_moe_core(
                 dispatch_output=dispatch_output,
             )
+            return ret
         
         return self._async_execute(_fn)
     
     def forward_expert_b(self, wrapped_tensor: StreamTensorWrapper):
         return wrapped_tensor.get_tensor()
 
+    def forward_shared_experts_a(self, forward_fn: Callable, hidden_states: torch.Tensor, flag: bool):
+        def _fn():
+            # ctx = nullcontext()
+            # if self.compute_num_sms is not None:
+            #     ctx = deep_gemm_wrapper.configure_deep_gemm_num_sms(self.compute_num_sms)
+            # with ctx:
+            if not flag:
+                ret = forward_fn(hidden_states, None)
+            else:
+                ret = None
+            return ret
+        return self._async_execute(_fn)
 
+    def forward_shared_experts_b(self, wrapped_tensor: StreamTensorWrapper):
+        return wrapped_tensor.get_tensor()
+        
     # hit operations
     def hit_dispatch_a(
         self,
@@ -452,16 +513,16 @@ class USCEPMoECache(DecodeCache):
         estimated_topk: TopKOutput,
         grounded_topk: TopKOutput,
     ):
-        # correct hit weights
-        moe_usc_hit_replace(
-            grounded_topk.topk_weights, 
-            miss_mask, 
-            hit_varlen_combine_output.topk_weights, 
-            hit_mask,
-            inplace=True
-        )
-        # get hit results, no need to apply miss mask
-        hit_varlen_combine_output.topk_ids.masked_fill_(~hit_mask, -1)
+        # # correct hit weights
+        # moe_usc_hit_replace(
+        #     grounded_topk.topk_weights, 
+        #     miss_mask, 
+        #     hit_varlen_combine_output.topk_weights, 
+        #     hit_mask,
+        #     inplace=True
+        # )
+        # # get hit results, no need to apply miss mask
+        # hit_varlen_combine_output.topk_ids.masked_fill_(~hit_mask, -1)
 
         # pack combine input
         self.experts.dispatcher.combine_a(
@@ -482,10 +543,11 @@ class USCEPMoECache(DecodeCache):
         grounded_topk: TopKOutput,
         miss_mask: torch.Tensor,
     ):
-        # TODO: implement EP _get_miss_cache
-        topk_output = self._get_miss_cache(
-            grounded_topk, miss_mask
-        )
+        # # TODO: implement EP _get_miss_cache
+        # topk_output = self._get_miss_cache(
+        #     grounded_topk, miss_mask
+        # )
+        topk_output = grounded_topk
 
         self.experts.dispatcher.dispatch_a(
             hidden_states=hidden_states,
@@ -533,13 +595,9 @@ class USCEPMoECache(DecodeCache):
     def _get_miss_cache(self, topk_output: TopKOutput, miss_mask: torch.Tensor):
         # ensure topk_idx is no longer used outside
         miss_topk_idx = topk_output.topk_ids
-        # miss_topk_weights = topk_output.topk_weights
-        # miss_router_logits = topk_output.router_logits
-
+        
         miss_topk_idx.masked_fill_(~miss_mask, -1)
-        # miss_topk_weights.masked_fill_(~miss_mask, 0.0)
-        # miss_router_logits.masked_fill_(~miss_mask, 0.0)
-
+        
         # hit mask is separated
         return StandardTopKOutput(
             topk_weights=topk_output.topk_weights,

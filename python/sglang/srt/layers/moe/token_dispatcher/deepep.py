@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_config,
     get_moe_runner_backend,
     is_tbo_enabled,
+    is_usc_enabled,
 )
 from sglang.srt.utils import (
     get_bool_env_var,

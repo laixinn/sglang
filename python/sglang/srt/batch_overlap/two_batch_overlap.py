@@ -829,15 +829,15 @@ def model_forward_maybe_tbo(
         layers, forward_batch.forward_mode
     )
     if enable_tbo:
-        if is_usc_enabled():
-            return _model_forward_non_tbo(inputs, operations_strategy, usc_mode=True)
-        else:
-            return _model_forward_tbo(
-                inputs=inputs,
-                operations_strategy=operations_strategy,
-                input_data_scatter_mode=input_data_scatter_mode,
-                layer_input_scatter_mode=layer_input_scatter_mode,
-            )
+        # if is_usc_enabled():
+        #     return _model_forward_non_tbo(inputs, operations_strategy, usc_mode=True)
+        # else:
+        return _model_forward_tbo(
+            inputs=inputs,
+            operations_strategy=operations_strategy,
+            input_data_scatter_mode=input_data_scatter_mode,
+            layer_input_scatter_mode=layer_input_scatter_mode,
+        )
     else:
         return _model_forward_non_tbo(inputs, operations_strategy)
 
@@ -1061,11 +1061,15 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
             inner.set_quant_config(quant_config)
 
     def set_overlap_args(
-        self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
+        self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict,
+        tbo_subbatch_index: Optional[int] = None
     ):
         super().set_overlap_args(combine_overlap_args, meta_overlap_args)
-        for inner in self._inners:
-            inner.set_overlap_args(combine_overlap_args, meta_overlap_args)
+        if tbo_subbatch_index is not None:
+            self._inners[tbo_subbatch_index].set_overlap_args(combine_overlap_args, meta_overlap_args)
+        else:
+            for inner in self._inners:
+                inner.set_overlap_args(combine_overlap_args, meta_overlap_args)
 
     def clear_overlap_args(self):
         super().clear_overlap_args()

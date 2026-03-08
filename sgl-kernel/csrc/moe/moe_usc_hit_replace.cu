@@ -135,6 +135,8 @@ void moe_usc_hit_replace(
   int32_t num_tokens = grounded_weights.size(0);
   int32_t topk = grounded_weights.size(1);
 
+  if (hit_weights.numel() == 0) return;
+
   TORCH_CHECK(hit_weights.dim() == 2, "hit_weights must be 2D [num_tokens, topk]");
   TORCH_CHECK(hit_weights.size(0) == num_tokens && hit_weights.size(1) == topk,
               "hit_weights must have shape [num_tokens, topk]");
