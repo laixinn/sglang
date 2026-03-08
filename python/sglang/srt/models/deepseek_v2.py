@@ -1086,7 +1086,7 @@ class DeepseekV2MoE(nn.Module):
             state.estimated_topk = self.usc_cache.index_estimate_b(estimate_event)
         else:
             state.estimated_topk = self.topk.full_topk_output(
-                state.hidden_states_mlp_input.device, state.hidden_states_mlp_input.shape[0], True)
+                state.hidden_states_after_attn.device, state.hidden_states_after_attn.shape[0], True)
 
     def op_usc_topk(self, state):
         if state.hidden_states_mlp_input.shape[0] > 0:
@@ -1114,13 +1114,24 @@ class DeepseekV2MoE(nn.Module):
 
         state.hit_varlen_combine_output = self.usc_cache.hit_forward_a(
             experts=self.experts,
-            hidden_states=state.hidden_states_mlp_input,
+            hidden_states=state.hidden_states_after_attn,
             estimated_topk=state.estimated_topk,
         )
 
     def op_usc_hit_b(self, state):
         state.hit_varlen_combine_output = \
             self.usc_cache.hit_forward_b(state.pop("hit_varlen_combine_output"))
+
+    def op_usc_hit_c(self, state):
+        state.hit_varlen_combine_output = \
+            self.usc_cache.hit_forward_c(
+                state.pop("hit_varlen_combine_output"), 
+                state.pop("residual_after_input_ln")
+            )
+
+    def op_usc_hit_d(self, state):
+        state.hit_varlen_combine_output, _ = \
+            self.usc_cache.hit_forward_d(state.pop("hit_varlen_combine_output"))
 
     def op_usc_miss(self, state):
         state.miss_varlen_combine_output = \
@@ -2911,7 +2922,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
@@ -3007,7 +3017,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
             self.layer_communicator.prepare_mlp(
                 state.pop("hidden_states_after_attn"),
-                state.pop("residual_after_input_ln"),
+                state.residual_after_input_ln,
                 state.forward_batch,
             )
         )
@@ -3207,6 +3217,8 @@ class DeepseekV2Model(nn.Module):
         so that predictions use the exact same logic as the actual model.
         """
         for i in range(self.start_layer, self.end_layer):
+            if self.layers[i].is_layer_sparse:
+                object.__setattr__(self.layers[i].mlp.usc_cache, 'post_attention_layernorm', self.layers[i].post_attention_layernorm)
             if self.layers[i].is_layer_sparse and i > 0:
                 object.__setattr__(self.layers[i-1].mlp, 'next_layer_gate', self.layers[i].mlp.gate)
                 object.__setattr__(self.layers[i-1].mlp, 'next_layer_topk', self.layers[i].mlp.topk)

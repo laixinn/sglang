@@ -306,24 +306,21 @@ class USCTPMoECache(DecodeCache):
             return hit_varlen_combine_output
         return self._async_execute(_fn)
 
-    def hit_forward_stage_a(
-        self,
-        experts: Callable,
-        hidden_states: torch.Tensor,
-        estimated_topk: TopKOutput,
-        stage: int,
-        dispatch_output: Optional[IntermediateDispatchOutput] = None,
-    ) -> IntermediateDispatchOutput:
-        hit_varlen_intermediate_output = experts(
-            hidden_states=hidden_states,
-            topk_output=estimated_topk,
-            stage=stage,
-            dispatch_output=dispatch_output,
-        )
-        
-        return hit_varlen_intermediate_output
-
     def hit_forward_b(self, wrapped_tensor: StreamTensorWrapper):
+        return wrapped_tensor.get_tensor()
+
+    def hit_forward_c(self, hidden_states: torch.Tensor, residual: torch.Tensor):
+        from sglang.srt.distributed.communication_op import tensor_model_parallel_all_reduce
+        def _fn():
+            # TODO: do this after moe up proj, and need correct layernorm normalization value
+            nonlocal hidden_states, residual
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states += residual.unsqueeze(1)
+            # hidden_states = self.post_attention_layernorm(hidden_states + residual.unsqueeze(1))
+            return hidden_states, residual
+        return self._async_execute(_fn)
+
+    def hit_forward_d(self, wrapped_tensor: StreamTensorWrapper):
         return wrapped_tensor.get_tensor()
 
     def miss_forward(
