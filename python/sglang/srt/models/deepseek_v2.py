@@ -3459,7 +3459,7 @@ class DeepseekV2Model(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo or (is_usc_enabled() and (forward_batch.forward_mode.is_prefill() or forward_batch.forward_mode.is_target_verify())):
+        if forward_batch.can_run_tbo or (is_usc_enabled() and (forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_target_verify())):
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer
