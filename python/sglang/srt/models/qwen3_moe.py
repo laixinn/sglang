@@ -50,10 +50,11 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, StandardTopKOutput
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    is_usc_enabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -72,10 +73,14 @@ from sglang.srt.models.utils import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
+    BumpAllocator,
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
     is_npu,
+)
+from sglang.srt.layers.moe.usc.moe_cache import (
+    USCTPMoECache, 
 )
 
 _is_cuda = is_cuda()
@@ -243,6 +248,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
+            filter_expert=True if is_usc_enabled() else False,
         )
 
         self.gate = ReplicatedLinear(
@@ -260,6 +266,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 config.num_experts + get_global_server_args().ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
+
+        if is_usc_enabled():
+            if get_moe_a2a_backend().is_deepep():
+                pass
+            else:
+                self.usc_cache = USCTPMoECache(self.experts)
 
     def forward(
         self,
@@ -399,6 +411,97 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def op_output(self, state):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
+
+    def op_usc_estimate_a(self, state):
+        if self.has_usc_estimation:
+            state.estimate_event = self.usc_cache.index_estimate_a(
+                self.usc_index_estimate,
+                forward_mode=state.forward_batch.forward_mode,
+                hidden_states=state.pop("hidden_states_for_estimate"),
+                num_token_non_padded=state.forward_batch.num_token_non_padded,
+            )
+        else:
+            state.pop("hidden_states_for_estimate")
+            state.estimate_event = None
+
+    def op_usc_estimate_b(self, state):
+        if (estimate_event := state.pop("estimate_event")) is not None:
+            state.estimated_topk = self.usc_cache.index_estimate_b(estimate_event)
+        else:
+            state.estimated_topk = self.topk.full_topk_output(
+                state.hidden_states_mlp_input.device, state.hidden_states_mlp_input.shape[0], True)
+
+    def op_usc_topk(self, state):
+        if state.hidden_states_mlp_input.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(state.hidden_states_mlp_input)
+            state.topk_output = self.topk(state.hidden_states_mlp_input, router_logits)
+        else:
+            state.topk_output = self.topk.full_topk_output(
+                state.hidden_states_mlp_input.device, state.hidden_states_mlp_input.shape[0], True)
+
+    def op_usc_verify(self, state):
+        # For first layer, estimated_topk is all -1 and hit_mask is all False
+        state.hit_mask, state.miss_mask = self.usc_cache._verify_cache(
+            state.topk_output, state.estimated_topk
+        )
+        
+    def op_usc_hit_a(self, state):
+        state.estimated_topk.topk_weights.fill_(1.0)
+
+        state.hit_varlen_combine_output = self.usc_cache.hit_forward_a(
+            experts=self.experts,
+            hidden_states=state.hidden_states_mlp_input,
+            estimated_topk=state.estimated_topk,
+        )
+
+    def op_usc_hit_b(self, state):
+        state.hit_varlen_combine_output = \
+            self.usc_cache.hit_forward_b(state.pop("hit_varlen_combine_output"))
+
+    def op_usc_miss(self, state):
+        state.miss_varlen_combine_output = \
+            self.usc_cache.miss_forward(
+                experts=self.experts,
+                hidden_states=state.hidden_states_mlp_input,
+                grounded_topk=state.topk_output,
+                miss_mask=state.miss_mask,
+            )
+
+    def op_usc_reduce(self, state):
+        state.hidden_states_after_combine = self.usc_cache.reduce(
+            state.pop("hit_varlen_combine_output"),
+            state.pop("miss_varlen_combine_output"),
+            state.pop("hit_mask"),
+            state.pop("miss_mask"),
+            1.0,
+            state.pop("estimated_topk"),
+            state.pop("topk_output"),
+        )
+
+    def op_usc_output(self, state):
+        final_hidden_states = state.pop("hidden_states_after_combine")
+        if (
+            self.tp_size > 1
+            and not state.pop("should_allreduce_fusion")
+            and not state.pop("use_reduce_scatter")
+        ):
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        state.hidden_states_mlp_output = final_hidden_states
+        state.pop("hidden_states_mlp_input")
+
+    def usc_index_estimate(self, forward_mode, hidden_states, num_token_non_padded):
+        if is_non_idle_and_non_empty(
+            forward_mode, hidden_states
+        ) and self.has_usc_estimation:
+            # router_logits: (num_tokens, n_experts)
+            estimated_router, _ = self.next_layer_gate(hidden_states)
+            estimated_topk = self.next_layer_topk(hidden_states, estimated_router)
+        else:
+            estimated_topk = self.topk.full_topk_output(hidden_states.device, hidden_states.shape[0], True)
+
+        return estimated_topk
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -867,6 +970,74 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         return output
 
+    def op_usc_comm_prepare_mlp(self, state):
+        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
+            self.layer_communicator.prepare_mlp(
+                state.pop("hidden_states_after_attn"),
+                state.pop("residual_after_input_ln"),
+                state.forward_batch,
+            )
+        )
+        state.should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                state.forward_batch
+            )
+        )
+        state.use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            state.forward_batch
+        )
+        # fused moe is inplace
+        state.hidden_states_for_estimate = state.hidden_states_mlp_input.clone()
+
+    def op_usc_comm_prepare_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: Optional[BumpAllocator] = None,
+        tbo_subbatch_index: Optional[int] = None,
+        estimate_event: Optional[StandardTopKOutput] = None,
+    ):
+        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
+            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        )
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
+                estimate_event=estimate_event,
+            )
+        )
+
+    def op_usc_comm_postprocess_layer(self, state):
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            state.pop("hidden_states_mlp_output"),
+            state.pop("residual_after_comm_pre_mlp"),
+            state.forward_batch,
+        )
+
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+            estimate_event=state.estimate_event,
+        )
+
+        state.clear(
+            expect_keys={
+                "positions",
+                "forward_batch",
+                "tbo_subbatch_index",
+                "estimate_event",
+            }
+        )
+        return output
+
 
 class Qwen3MoeModel(Qwen2MoeModel):
     def __init__(
@@ -884,6 +1055,26 @@ class Qwen3MoeModel(Qwen2MoeModel):
             decoder_layer_type=decoder_layer_type,
             alt_stream=alt_stream,
         )
+
+        self._setup_next_layer_gates()
+
+    def _setup_next_layer_gates(self):
+        """Set up next_layer_gate and next_layer_topk for index prediction.
+        
+        Links each MoE layer to the next layer's gate and topk modules,
+        so that predictions use the exact same logic as the actual model.
+        """
+        for i in range(self.start_layer, self.end_layer):
+            if self.layers[i].is_layer_sparse and i > 0:
+                object.__setattr__(self.layers[i-1].mlp, 'next_layer_gate', self.layers[i].mlp.gate)
+                object.__setattr__(self.layers[i-1].mlp, 'next_layer_topk', self.layers[i].mlp.topk)
+                object.__setattr__(self.layers[i-1].mlp, 'has_usc_estimation', True)
+                if i == self.end_layer - 1:
+                    object.__setattr__(self.layers[i].mlp, 'has_usc_estimation', False)
+            else:
+                object.__setattr__(self.layers[i].mlp, 'next_layer_gate', None)
+                object.__setattr__(self.layers[i].mlp, 'next_layer_topk', None)
+                object.__setattr__(self.layers[i].mlp, 'has_usc_estimation', False)
 
 
 class Qwen3MoeForCausalLM(nn.Module):

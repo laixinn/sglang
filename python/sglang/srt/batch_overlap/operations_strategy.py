@@ -170,7 +170,7 @@ def _compute_moe_usc_layer_operations_strategy_tbo(
 def _compute_moe_usc_decode(layer):
     device_properties = torch.cuda.get_device_properties(device="cuda")
     total_num_sms = device_properties.multi_processor_count
-    deep_gemm_num_sms = 20 # total_num_sms - DeepEPConfig.get_instance().num_sms
+    deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
 
     # TODO: add YieldOperation
     return OperationsStrategy(
@@ -180,23 +180,19 @@ def _compute_moe_usc_decode(layer):
             layer.op_usc_comm_prepare_attn,
             layer.self_attn.op_prepare,
             layer.self_attn.op_core,
-
-            layer.mlp.op_usc_estimate_b, # estimated topk is ready
-            layer.mlp.op_usc_hit_a,  # overlap hit forward with op_gate+op_select_experts
-
             layer.op_usc_comm_prepare_mlp,
             
+            layer.mlp.op_usc_estimate_b, # estimated topk is ready
+
+            layer.mlp.op_usc_hit_a,  # overlap hit forward with op_gate+op_select_experts
+
             layer.mlp.op_usc_topk,
             
             layer.mlp.op_usc_verify, # sync: use true and estimated topk
 
-            layer.mlp.op_usc_hit_b,  # get full estimated topk results
-            layer.mlp.op_usc_hit_c,  # all reduce hit results
-
             layer.mlp.op_usc_miss,   # get partial true topk results and shared experts
             
-            layer.mlp.op_usc_hit_d,  # get full hit results
-            
+            layer.mlp.op_usc_hit_b,  # get full estimated topk results
             layer.mlp.op_usc_reduce, # sync: take partial hit results, combine and then reduce
 
             layer.mlp.op_usc_estimate_a, # launch topk estimation, old results have been cleaned
@@ -222,7 +218,10 @@ def _compute_moe_qwen3_layer_operations_strategy_tbo(
     elif (
         forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
     ):
-        return _compute_moe_qwen3_decode(layer)
+        if is_usc_enabled():
+            return _compute_moe_usc_decode(layer)
+        else:
+            return _compute_moe_qwen3_decode(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
 
