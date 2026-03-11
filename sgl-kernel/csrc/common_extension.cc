@@ -202,6 +202,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_usc_hit_replace", torch::kCUDA, &moe_usc_hit_replace);
 
   m.def(
+      "fused_verify_remap(Tensor actual_indices, Tensor predicted_indices, "
+      "Tensor(a!) hit_out, Tensor(b!) remap_out) -> ()");
+  m.impl("fused_verify_remap", torch::kCUDA, &fused_verify_remap);
+
+  m.def(
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "
       "moe_softcapping, Tensor? correction_bias) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);

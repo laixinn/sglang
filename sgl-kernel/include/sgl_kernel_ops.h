@@ -315,6 +315,12 @@ void moe_usc_hit_replace(
     torch::Tensor& hit_weights,
     torch::Tensor hit_mask);
 
+void fused_verify_remap(
+    torch::Tensor actual_indices,
+    torch::Tensor predicted_indices,
+    torch::Tensor& hit_out,
+    torch::Tensor& remap_out);
+
 void topk_softmax(
     torch::Tensor& topk_weights,
     torch::Tensor& topk_indices,

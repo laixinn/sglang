@@ -24,6 +24,7 @@ import triton.language as tl
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+from sgl_kernel.moe import fused_verify_remap as fused_verify_remap_cuda
 
 @triton.jit
 def _fused_verify_remap_kernel(
@@ -983,7 +984,7 @@ class USCSparseAttnCache:
             out_view = torch.bmm(
                 q_all.contiguous(),
                 selected_k.transpose(1, 2).contiguous(),
-            ) 
+            )
             return out_view
 
             # # Try DeepGEMM BF16 path for Q@K^T
@@ -1174,19 +1175,19 @@ class USCSparseAttnCache:
 
         # ---- Compute hit_mask and remap_pos on-demand (eliminate intermediate buffers) ----
         if has_hit:
-            hit_raw = torch.empty(s_q, topk, dtype=torch.int8, device=device)
-            remap_pos = torch.empty(s_q, topk, dtype=torch.int32, device=device)
+            # hit_raw = torch.empty(s_q, topk, dtype=torch.int8, device=device)
+            # remap_pos = torch.empty(s_q, topk, dtype=torch.int32, device=device)
 
-            _fused_verify_remap_kernel[(s_q, triton.cdiv(topk, 64))]( # BLOCK_A=64, BLOCK_P=64
-                actual_indices,
-                predicted_indices,
-                hit_raw,
-                remap_pos,
-                topk, predicted_indices.shape[-1],
-                actual_indices.stride(0), predicted_indices.stride(0),
-                BLOCK_A=64, BLOCK_P=64,
-            )
-            hit_mask_for_partition = hit_raw
+            # _fused_verify_remap_kernel[(s_q, triton.cdiv(topk, 64))]( # BLOCK_A=64, BLOCK_P=64
+            #     actual_indices,
+            #     predicted_indices,
+            #     hit_raw,
+            #     remap_pos,
+            #     topk, predicted_indices.shape[-1],
+            #     actual_indices.stride(0), predicted_indices.stride(0),
+            #     BLOCK_A=64, BLOCK_P=64,
+            # )
+            hit_mask_for_partition, remap_pos = fused_verify_remap_cuda(actual_indices.to(torch.int64), predicted_indices.to(torch.int64))
         else:
             hit_mask_for_partition = None
             remap_pos = None

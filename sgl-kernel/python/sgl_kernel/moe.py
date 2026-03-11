@@ -66,6 +66,40 @@ def moe_usc_hit_replace(
     return new_hit_weights
 
 
+def fused_verify_remap(
+    actual_indices: torch.Tensor,
+    predicted_indices: torch.Tensor,
+) -> None:
+    """
+    For each token row and each of its `topk` actual KV page indices, determine:
+      hit_out[n, i]   = 1  iff  actual_indices[n, i] appears in predicted_indices[n, :]
+                             AND actual_indices[n, i] >= 0  (not -1 padding)
+      remap_out[n, i] = position j in predicted_indices[n, :] where the match was found
+                        (0 when hit_out[n, i] == 0)
+
+    Uses a shared-memory hash table (O(topk + pred_topk) per token row).
+
+    Args:
+        actual_indices:    [N, topk]      int64 — actual KV page indices; -1 = padding
+        predicted_indices: [N, pred_topk] int64 — predicted KV page indices; -1 = padding
+
+    Returns:
+        hit_out:           [N, topk]      int8  — output hit mask (pre-allocated, written in-place)
+        remap_out:         [N, topk]      int32 — output remap positions (pre-allocated, written in-place)
+    """
+    hit_out = torch.empty_like(actual_indices, dtype=torch.int8)
+    remap_out = torch.empty_like(actual_indices, dtype=torch.int32)
+
+    torch.ops.sgl_kernel.fused_verify_remap.default(
+        actual_indices,
+        predicted_indices,
+        hit_out,
+        remap_out,
+    )
+
+    return hit_out, remap_out
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
