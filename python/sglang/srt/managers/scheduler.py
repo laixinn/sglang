@@ -13,12 +13,27 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import ctypes
+import ctypes.util
 import faulthandler
 import logging
 import os
 import signal
 import sys
 import time
+
+# tilelang's libcudart_stub.so registers itself as "libcudart" in /proc/self/maps
+# but is missing symbols like cudaDeviceReset.  flashinfer.comm.cuda_ipc uses
+# find_loaded_library("libcudart") which returns the first match in maps — the
+# stub — and then fails with "undefined symbol: cudaDeviceReset".
+# Pre-loading the real libcudart with RTLD_GLOBAL here (before any other module
+# that triggers tilelang or flashinfer.comm) ensures the real path appears first
+# in /proc/self/maps, so find_loaded_library returns the real libcudart.
+try:
+    _cudart = ctypes.util.find_library("cudart") or "libcudart.so.12"
+    ctypes.CDLL(_cudart, mode=ctypes.RTLD_GLOBAL)
+except OSError:
+    pass
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus

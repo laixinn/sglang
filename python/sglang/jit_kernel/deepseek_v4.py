@@ -6,6 +6,14 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    import tilelang
+    import tilelang.language as T
+
+    _tilelang_available = True
+except ImportError:
+    _tilelang_available = False
+
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -748,6 +756,377 @@ def tilelang_make_swa_prefill_indices(
     kernel = _tilelang_make_swa_indices_kernel(swa_window_size)
     kernel(seq_lens_k, seq_lens_q, cu_seqlens_q, swa_indices)
     return swa_indices
+
+
+# ---------------------------------------------------------------------------
+# FP4 quantization — mirrors HF DeepSeek-V4-Pro inference/kernel.py exactly.
+#
+# NOTE on "from __future__ import annotations" (PEP-563):
+# This module uses PEP-563 which converts ALL annotations to strings at
+# definition time.  tilelang's get_type_hints() tries to evaluate those strings
+# and fails when they resolve to tvm.tir.Buffer objects rather than Python
+# types.  The workaround: define @T.prim_func kernels WITHOUT annotation
+# syntax; instead, manually assign __annotations__ after the function def
+# (as dict values that are already evaluated tvm.tir.Buffer objects).  The
+# dict assignment is never subject to PEP-563 stringification.
+# ---------------------------------------------------------------------------
+
+_FP4 = "float4_e2m1fn"
+_FE8M0 = "float8_e8m0fnu"
+_BF16 = "bfloat16"
+_FP32 = "float32"
+
+_FP4_PASS_CONFIGS = (
+    {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
+    if _tilelang_available
+    else {}
+)
+
+
+def _fp4_fast_round_scale(amax, fp4_max_inv):
+    """Power-of-2 scale via IEEE-754 bit ops (matches HF kernel.py fast_round_scale)."""
+    bits_x = T.reinterpret("uint32", amax * fp4_max_inv)
+    exp_x = (bits_x >> 23) & 0xFF
+    man_bits = bits_x & ((1 << 23) - 1)
+    log2_ceil = T.Cast("int32", exp_x - 127 + T.if_then_else(man_bits != 0, 1, 0))
+    return T.reinterpret("float32", (log2_ceil + 127) << 23)
+
+
+def _fp4_build_prim_func(M, N, group_size, in_dtype, out_dtype, scale_dtype, compute_dtype, fp4_max, fp4_max_inv, blk_m, inplace):
+    """Build and return a T.prim_func for FP4 quantization.
+
+    This function lives OUTSIDE @tilelang.jit so the tilelang AST tracer
+    never sees the __annotations__ assignment.  The annotation dict contains
+    already-evaluated tvm.tir.Buffer objects, bypassing PEP-563 stringification
+    that would otherwise turn them into unresolvable ForwardRef strings.
+    """
+    def fp4_quant_kernel_(X, Y, S):
+        with T.Kernel(
+            T.ceildiv(M, blk_m), T.ceildiv(N, group_size), threads=128
+        ) as (pid_m, pid_n):
+            x_shared = T.alloc_shared((blk_m, group_size), in_dtype)
+            x_local = T.alloc_fragment((blk_m, group_size), in_dtype)
+            amax_local = T.alloc_fragment((blk_m,), compute_dtype)
+            s_local = T.alloc_fragment((blk_m,), compute_dtype)
+            y_local = T.alloc_fragment((blk_m, group_size), out_dtype)
+            y_shared = T.alloc_shared((blk_m, group_size), out_dtype)
+
+            for _ in T.Pipelined(1, num_stages=2):
+                T.copy(X[pid_m * blk_m, pid_n * group_size], x_shared)
+                T.copy(x_shared, x_local)
+                T.reduce_absmax(x_local, amax_local, dim=1)
+                for i in T.Parallel(blk_m):
+                    amax_local[i] = T.max(amax_local[i], 6 * (2**-126))
+                    s_local[i] = _fp4_fast_round_scale(amax_local[i], fp4_max_inv)
+                if inplace:
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.Cast(
+                            out_dtype,
+                            T.Cast(
+                                compute_dtype,
+                                T.Cast(_FP4, T.clamp(
+                                    x_local[i, j] / s_local[i],
+                                    -fp4_max, fp4_max,
+                                )),
+                            ) * s_local[i],
+                        )
+                else:
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.clamp(
+                            x_local[i, j] / s_local[i], -fp4_max, fp4_max
+                        )
+                for i in T.Parallel(blk_m):
+                    S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
+                T.copy(y_local, y_shared)
+                T.copy(y_shared, Y[pid_m * blk_m, pid_n * group_size])
+
+    # Dict assignment is NOT subject to PEP-563 stringification; the values
+    # are tvm.tir.Buffer objects that tilelang's get_type_hints can use directly.
+    fp4_quant_kernel_.__annotations__ = {
+        "X": T.Tensor[(M, N), in_dtype],
+        "Y": T.Tensor[(M, N), out_dtype],
+        "S": T.Tensor[(M, T.ceildiv(N, group_size)), scale_dtype],
+    }
+    return T.prim_func(fp4_quant_kernel_)
+
+
+if _tilelang_available:
+
+    @tilelang.jit(pass_configs=_FP4_PASS_CONFIGS)
+    def _fp4_quant_kernel(
+        N, block_size=32, in_dtype=_BF16, scale_dtype=_FE8M0, inplace=False
+    ):
+        """Block-wise FP4 quantization (MXFP4, E2M1, FE8M0 power-of-2 scale).
+        inplace=True: fused quant+dequant back to BF16 (QAT simulation)."""
+        M = T.symbolic("M")
+        fp4_max = 6.0
+        fp4_max_inv = 1.0 / fp4_max
+        blk_m = 32
+        group_size = block_size
+        compute_dtype = _FP32
+        out_dtype = in_dtype if inplace else _FP4
+        return _fp4_build_prim_func(
+            M, N, group_size, in_dtype, out_dtype, scale_dtype,
+            compute_dtype, fp4_max, fp4_max_inv, blk_m, inplace,
+        )
+
+
+def fp4_act_quant(
+    x: torch.Tensor,
+    block_size: int = 32,
+    inplace: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Block-wise MXFP4 quantization (matches HF DeepSeek-V4-Pro inference/kernel.py).
+
+    Returns (fp4_packed, fe8m0_scales) unless inplace=True, which does fused
+    quant+dequant back to BF16 (QAT simulation) and returns x.
+    """
+    if not _tilelang_available:
+        raise RuntimeError(
+            "fp4_act_quant requires TileLang. Install with: pip install tilelang"
+        )
+    N = x.size(-1)
+    assert N % block_size == 0
+    z = x.contiguous()
+    y = (
+        torch.empty_like(z)
+        if inplace
+        else z.new_empty(*z.shape[:-1], N // 2, dtype=torch.float4_e2m1fn_x2)
+    )
+    s = z.new_empty(*z.size()[:-1], N // block_size, dtype=torch.float8_e8m0fnu)
+    _fp4_quant_kernel(N, block_size, inplace=inplace)(
+        z.view(-1, N), y.view(-1, y.size(-1)), s.view(-1, N // block_size)
+    )
+    if inplace:
+        x.copy_(y)
+        return x
+    return y, s
+
+
+_FP4_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
+
+def _fp4_build_paged_mqa_prim_func(
+    N, L, S, C, B, D, H, D_fp4, S_fe8m0, d_0, d_1, fp4_block_size, clear_accum, lut
+):
+    """Build T.prim_func for FP4 paged MQA logits.
+
+    Lives OUTSIDE @tilelang.jit so the tilelang AST tracer never sees the
+    __annotations__ assignment.  Annotation dict holds already-evaluated
+    tvm.tir.Buffer / StridedBuffer objects, bypassing PEP-563 stringification.
+
+    Implements the PR #23686 idea: dequant K from MXFP4 → BF16 on-the-fly,
+    then compute BF16 × BF16 GEMM for logits.
+    """
+    def fp4_paged_mqa_logits_(q, kvcache_fp4, kvcache_fe8m0, weight, seq_lens, page_table, o):
+        _ = N, L, S, C, D, H, B, D_fp4, S_fe8m0, d_0, d_1
+        with T.Kernel(N) as bx:
+            seq_len = seq_lens[bx]
+
+            q_fp8_smem = T.alloc_shared((H, D), T.float8_e4m3)
+            q_smem = T.alloc_shared((H, D), T.bfloat16)
+            q_s_frag = T.alloc_fragment((H,), T.float32)
+            T.copy(q[bx, 0, 0], q_fp8_smem)
+            T.copy(weight[bx, 0], q_s_frag)
+            for h, d in T.Parallel(H, D):
+                q_smem[h, d] = T.cast(q_fp8_smem[h, d], T.bfloat16)
+
+            for i in T.Pipelined(T.ceildiv(seq_len, B), num_stages=2):
+                page = page_table[bx, i]
+
+                k_fp4_smem = T.alloc_shared((B, D_fp4), T.uint8)
+                k_fe8m0_smem = T.alloc_shared((B, S_fe8m0), T.uint8)
+                T.copy(kvcache_fp4[page, 0, 0], k_fp4_smem)
+                T.copy(kvcache_fe8m0[page, 0, 0], k_fe8m0_smem)
+
+                # Dequant FP4 → BF16 (PR #23686 style: unpack nibbles + FE8M0 scale)
+                k_bf16_smem = T.alloc_shared((B, D), T.bfloat16)
+                for j, d2 in T.Parallel(B, D_fp4):
+                    packed = T.cast(k_fp4_smem[j, d2], T.int32)
+                    lo_nibble = packed & 0x0F
+                    hi_nibble = (packed >> 4) & 0x0F
+                    scale_idx = (2 * d2) // fp4_block_size
+                    fe8m0_val = T.cast(k_fe8m0_smem[j, scale_idx], T.int32)
+                    scale_f32 = T.exp2(T.cast(fe8m0_val - 127, T.float32))
+                    scale_bf16 = T.cast(scale_f32, T.bfloat16)
+                    lo_val = T.if_then_else(lo_nibble == 0, T.cast(lut[0], T.bfloat16),
+                             T.if_then_else(lo_nibble == 1, T.cast(lut[1], T.bfloat16),
+                             T.if_then_else(lo_nibble == 2, T.cast(lut[2], T.bfloat16),
+                             T.if_then_else(lo_nibble == 3, T.cast(lut[3], T.bfloat16),
+                             T.if_then_else(lo_nibble == 4, T.cast(lut[4], T.bfloat16),
+                             T.if_then_else(lo_nibble == 5, T.cast(lut[5], T.bfloat16),
+                             T.if_then_else(lo_nibble == 6, T.cast(lut[6], T.bfloat16),
+                             T.if_then_else(lo_nibble == 7, T.cast(lut[7], T.bfloat16),
+                             T.if_then_else(lo_nibble == 8, T.cast(lut[8], T.bfloat16),
+                             T.if_then_else(lo_nibble == 9, T.cast(lut[9], T.bfloat16),
+                             T.if_then_else(lo_nibble == 10, T.cast(lut[10], T.bfloat16),
+                             T.if_then_else(lo_nibble == 11, T.cast(lut[11], T.bfloat16),
+                             T.if_then_else(lo_nibble == 12, T.cast(lut[12], T.bfloat16),
+                             T.if_then_else(lo_nibble == 13, T.cast(lut[13], T.bfloat16),
+                             T.if_then_else(lo_nibble == 14, T.cast(lut[14], T.bfloat16),
+                             T.cast(lut[15], T.bfloat16))))))))))))))))
+                    hi_val = T.if_then_else(hi_nibble == 0, T.cast(lut[0], T.bfloat16),
+                             T.if_then_else(hi_nibble == 1, T.cast(lut[1], T.bfloat16),
+                             T.if_then_else(hi_nibble == 2, T.cast(lut[2], T.bfloat16),
+                             T.if_then_else(hi_nibble == 3, T.cast(lut[3], T.bfloat16),
+                             T.if_then_else(hi_nibble == 4, T.cast(lut[4], T.bfloat16),
+                             T.if_then_else(hi_nibble == 5, T.cast(lut[5], T.bfloat16),
+                             T.if_then_else(hi_nibble == 6, T.cast(lut[6], T.bfloat16),
+                             T.if_then_else(hi_nibble == 7, T.cast(lut[7], T.bfloat16),
+                             T.if_then_else(hi_nibble == 8, T.cast(lut[8], T.bfloat16),
+                             T.if_then_else(hi_nibble == 9, T.cast(lut[9], T.bfloat16),
+                             T.if_then_else(hi_nibble == 10, T.cast(lut[10], T.bfloat16),
+                             T.if_then_else(hi_nibble == 11, T.cast(lut[11], T.bfloat16),
+                             T.if_then_else(hi_nibble == 12, T.cast(lut[12], T.bfloat16),
+                             T.if_then_else(hi_nibble == 13, T.cast(lut[13], T.bfloat16),
+                             T.if_then_else(hi_nibble == 14, T.cast(lut[14], T.bfloat16),
+                             T.cast(lut[15], T.bfloat16))))))))))))))))
+                    k_bf16_smem[j, 2 * d2]     = lo_val * scale_bf16
+                    k_bf16_smem[j, 2 * d2 + 1] = hi_val * scale_bf16
+
+                # BF16 K × BF16 Q^T → FP32 logits[B, H]
+                logits = T.alloc_fragment((B, H), T.float32)
+                T.gemm(
+                    k_bf16_smem,
+                    q_smem,
+                    logits,
+                    transpose_A=False,
+                    transpose_B=True,
+                    clear_accum=True,
+                )
+
+                # ReLU + weight scaling + reduce across heads
+                for h, j in T.Parallel(H, B):
+                    logits[j, h] = T.max(logits[j, h], 0.0) * q_s_frag[h]
+                logits_sum = T.alloc_fragment((B,), T.float32)
+                T.reduce_sum(logits, logits_sum, dim=1)
+                T.copy(logits_sum, o[bx, i * B])
+
+    fp4_paged_mqa_logits_.__annotations__ = {
+        "q":           T.Tensor[(N, H, D), T.float8_e4m3],
+        "kvcache_fp4": T.StridedTensor[(C, B, D_fp4), (d_0, D_fp4, 1), T.uint8],
+        "kvcache_fe8m0": T.StridedTensor[(C, B, S_fe8m0), (d_1, S_fe8m0, 1), T.uint8],
+        "weight":      T.Tensor[(N, H), T.float32],
+        "seq_lens":    T.Tensor[(N,), T.int32],
+        "page_table":  T.Tensor[(N, L), T.int32],
+        "o":           T.Tensor[(N, S), T.float32],
+    }
+    return T.prim_func(fp4_paged_mqa_logits_)
+
+
+if _tilelang_available:
+
+    @tilelang.jit(pass_configs=_FP4_PASS_CONFIGS)
+    def _fp4_paged_mqa_logits_kernel(
+        head_dim: int = 128,
+        num_heads: int = 64,
+        block_size: int = 64,
+        fp4_block_size: int = 32,
+        clear_accum: bool = True,
+    ):
+        """FP4 paged MQA logits kernel (PR #23686 style: K dequant FP4→BF16, BF16×BF16 GEMM).
+
+        Q: (N, H, D) FP8-e4m3  — converted to BF16 in smem
+        K: MXFP4 packed (FP4 nibbles + FE8M0 scales) — dequanted to BF16 on-the-fly
+        output: (N, S) FP32  — ReLU(K @ Q^T) * weight, summed across heads
+        """
+        N = T.dynamic("batch_size")
+        L = T.dynamic("max_table_length")
+        S = T.dynamic("max_seq_len")
+        C = T.dynamic("num_blocks")
+        B = block_size
+        D = head_dim
+        H = num_heads
+        D_fp4 = D // 2
+        S_fe8m0 = D // fp4_block_size
+        d_0, d_1 = T.dynamic("d_0"), T.dynamic("d_1")
+
+        assert D == 128
+        assert H % 4 == 0
+
+        return _fp4_build_paged_mqa_prim_func(
+            N, L, S, C, B, D, H, D_fp4, S_fe8m0, d_0, d_1,
+            fp4_block_size, clear_accum, _FP4_LUT,
+        )
+
+
+def tilelang_fp4_paged_mqa_logits(
+    q_fp8: torch.Tensor,
+    kvcache_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    """FP4 K-cache paged MQA logits (W4A16-style: K dequant FP4->BF16, BF16xBF16 wgmma).
+
+    Args:
+        q_fp8: (batch, 1, num_heads, head_dim) FP8
+        kvcache_fp4: (num_pages, block_size, 1, 68) uint8
+                     68 = 64 bytes FP4-packed K + 4 bytes FE8M0 scale
+    Returns:
+        logits: (batch, max_seq_len) FP32
+    """
+    if not _tilelang_available:
+        raise RuntimeError(
+            "tilelang_fp4_paged_mqa_logits requires TileLang. "
+            "Install with: pip install tilelang"
+        )
+    if torch.cuda.get_device_capability()[0] < 9:
+        raise RuntimeError(
+            "tilelang_fp4_paged_mqa_logits requires SM90 (Hopper) or later. "
+            f"Current device: SM{torch.cuda.get_device_capability()[0]}{torch.cuda.get_device_capability()[1]}"
+        )
+    _ = deep_gemm_metadata
+    batch_size, _, num_heads, head_dim = q_fp8.shape
+    # kvcache_fp4: (num_pages, block_size, 1, token_bytes) uint8
+    num_pages = kvcache_fp4.shape[0]
+    block_size = kvcache_fp4.shape[1]
+    fp4_block_size = 32
+    k_fp4_bytes = head_dim // 2      # 64 bytes of packed FP4 K per token
+    fe8m0_bytes = head_dim // fp4_block_size  # 4 bytes of FE8M0 scales per token
+    token_bytes = k_fp4_bytes + fe8m0_bytes   # 68
+
+    assert head_dim == 128
+    assert block_size == 64
+    assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
+    assert kvcache_fp4.shape[1:] == (block_size, 1, token_bytes)
+    assert weight.shape == (batch_size, num_heads)
+    assert seq_lens.shape == (batch_size,)
+    assert page_table.shape[0] == batch_size
+    assert clean_logits == False
+
+    # Flatten to (num_pages, block_size, token_bytes) for stride computation
+    # Memory layout: for each (page, tok), the token_bytes are laid out as
+    #   [fp4[0..63] | fe8m0[0..3]]  contiguously.
+    # Stride for the page dimension = block_size * token_bytes.
+    kv_flat = kvcache_fp4.view(num_pages, block_size, token_bytes)  # (C, B, 68)
+    page_stride = block_size * token_bytes  # stride in bytes across pages
+
+    # Create StridedTensors pointing into the interleaved buffer with explicit strides.
+    # TileLang StridedTensor[(C, B, D_fp4), (d_0, D_fp4, 1)] means:
+    #   element[c, b, d] = base_ptr + c * d_0 + b * D_fp4 + d * 1
+    # For FP4 part: base = start of kv_flat, d_0 = page_stride, second stride = D_fp4 (= 64)
+    # For FE8M0 part: base = kv_flat offset by k_fp4_bytes per token, d_0 = page_stride, second stride = S_fe8m0 (= 4)
+    kv_fp4 = kv_flat[:, :, :k_fp4_bytes].contiguous()   # (C, B, 64) uint8, fp4 bytes
+    kv_fe8m0 = kv_flat[:, :, k_fp4_bytes:].contiguous() # (C, B, 4)  uint8, fe8m0 bytes
+
+    logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
+    kernel = _fp4_paged_mqa_logits_kernel(
+        head_dim=head_dim,
+        num_heads=num_heads,
+        block_size=block_size,
+        fp4_block_size=fp4_block_size,
+        clear_accum=clean_logits,
+    )
+    q_flat = q_fp8.view(batch_size, num_heads, head_dim)
+    kernel(q_flat, kv_fp4, kv_fe8m0, weight, seq_lens, page_table, logits)
+    return logits
 
 
 @triton.jit

@@ -538,6 +538,7 @@ class Envs:
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
 
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    SGLANG_OPT_USE_TILELANG_INDEXER_FP4 = EnvBool(False)  # W4A16-style MXFP4 K-cache for indexer (SM90)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
 

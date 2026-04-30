@@ -163,7 +163,18 @@ class CompressorBackend:
                 tag=f"indexer_compressor(ratio={compressor.ratio}) layer_id={layer_id}",
                 forward_batch=forward_batch,
             )
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        if envs.SGLANG_OPT_USE_TILELANG_INDEXER_FP4.get():
+            from sglang.jit_kernel.deepseek_v4 import fp4_act_quant
+
+            kv_flat = new_compressed_kv.view(-1, new_compressed_kv.shape[-1]).bfloat16()
+            kv_fp4, kv_fe8m0 = fp4_act_quant(kv_flat.contiguous(), block_size=32, inplace=False)
+            token_to_kv_pool.set_index_k_fp4_buffer(
+                layer_id=layer_id,
+                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                index_k_fp4=kv_fp4.view(torch.uint8).contiguous(),
+                index_k_fe8m0=kv_fe8m0.view(torch.uint8).contiguous(),
+            )
+        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
                 loc=self.forward_metadata.core_metadata.c4_out_loc,

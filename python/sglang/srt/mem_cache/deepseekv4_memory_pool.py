@@ -355,6 +355,130 @@ class DeepSeekV4IndexerPool(KVCache):
         )
 
 
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _set_k_fp4_and_fe8m0_kernel(
+    buf_ptr,
+    loc_ptr,
+    index_k_fp4_ptr,
+    index_k_fe8m0_ptr,
+    k_fp4_stride_0,
+    fe8m0_stride_0,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    K_FP4_BYTES_PER_TOKEN: tl.constexpr,  # head_dim // 2 = 64
+    FE8M0_BYTES_PER_TOKEN: tl.constexpr,  # head_dim // fp4_block_size = 4
+):
+    """Scatter FP4-packed K bytes and FE8M0 scale bytes into paged buffer."""
+    token_id = tl.program_id(0)
+    loc = tl.load(loc_ptr + token_id)
+    loc_page_index = loc // PAGE_SIZE
+    loc_token_offset = loc % PAGE_SIZE
+
+    # Offset of this token's slot in the page buffer
+    # Layout per page: PAGE_SIZE * (K_FP4 + FE8M0) bytes, per-token interleaved as [K_FP4 | FE8M0]
+    token_slot_start = loc_page_index * BUF_NUMEL_PER_PAGE + loc_token_offset * (K_FP4_BYTES_PER_TOKEN + FE8M0_BYTES_PER_TOKEN)
+
+    # Write K FP4 bytes
+    k_in_offsets = token_id * k_fp4_stride_0 + tl.arange(0, K_FP4_BYTES_PER_TOKEN)
+    k_fp4 = tl.load(index_k_fp4_ptr + k_in_offsets)
+    tl.store(buf_ptr + token_slot_start + tl.arange(0, K_FP4_BYTES_PER_TOKEN), k_fp4)
+
+    # Write FE8M0 scale bytes
+    fe8m0_in_offsets = token_id * fe8m0_stride_0 + tl.arange(0, FE8M0_BYTES_PER_TOKEN)
+    fe8m0 = tl.load(index_k_fe8m0_ptr + fe8m0_in_offsets)
+    tl.store(buf_ptr + token_slot_start + K_FP4_BYTES_PER_TOKEN + tl.arange(0, FE8M0_BYTES_PER_TOKEN), fe8m0)
+
+
+def _set_k_fp4_to_page_buffer(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    index_k_fp4: torch.Tensor,
+    index_k_fe8m0: torch.Tensor,
+    page_size: int,
+    k_fp4_bytes: int,
+    fe8m0_bytes: int,
+) -> None:
+    """
+    :param buf: (num_pages, page_bytes) uint8
+    :param loc: (num_tokens,) int64, token indices to write
+    :param index_k_fp4: (num_tokens, k_fp4_bytes) uint8
+    :param index_k_fe8m0: (num_tokens, fe8m0_bytes) uint8
+    """
+    assert buf.dtype == torch.uint8 and buf.is_contiguous()
+    assert index_k_fp4.dtype == torch.uint8 and index_k_fp4.is_contiguous()
+    assert index_k_fe8m0.dtype == torch.uint8 and index_k_fe8m0.is_contiguous()
+    num_tokens = loc.shape[0]
+    buf_numel_per_page = buf.shape[1]
+    _set_k_fp4_and_fe8m0_kernel[(num_tokens,)](
+        buf,
+        loc.to(torch.int64),
+        index_k_fp4,
+        index_k_fe8m0,
+        index_k_fp4.stride(0),
+        index_k_fe8m0.stride(0),
+        PAGE_SIZE=page_size,
+        BUF_NUMEL_PER_PAGE=buf_numel_per_page,
+        K_FP4_BYTES_PER_TOKEN=k_fp4_bytes,
+        FE8M0_BYTES_PER_TOKEN=fe8m0_bytes,
+    )
+
+
+class DeepSeekV4IndexerPoolFP4(DeepSeekV4IndexerPool):
+    """K cache stored as MXFP4 (float4_e2m1fn_x2) + FE8M0 block scales.
+
+    Per-token layout: [64 bytes FP4-packed K | 4 bytes FE8M0 scale] = 68 bytes
+    vs 132 bytes for FP8 path. Reduces K-cache bandwidth by ~48%.
+
+    fp4_block_size=32: 128-dim token has 4 FE8M0 scales.
+    """
+
+    fp4_block_size = 32
+
+    def _create_buffer(self):
+        k_fp4_bytes = self.index_head_dim // 2          # 64
+        fe8m0_bytes = self.index_head_dim // self.fp4_block_size  # 4
+        page_bytes = self.page_size * (k_fp4_bytes + fe8m0_bytes)  # 64 * 68 = 4352
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.index_k_with_scale_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size + 1) // self.page_size,
+                        page_bytes,
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+    def set_index_k_fp4_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k_fp4: torch.Tensor,
+        index_k_fe8m0: torch.Tensor,
+    ) -> None:
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        _set_k_fp4_to_page_buffer(
+            buf=buf,
+            loc=loc.to(torch.int64),
+            index_k_fp4=index_k_fp4,
+            index_k_fe8m0=index_k_fe8m0,
+            page_size=self.page_size,
+            k_fp4_bytes=self.index_head_dim // 2,
+            fe8m0_bytes=self.index_head_dim // self.fp4_block_size,
+        )
+
+    # get_index_k_with_scale_buffer is inherited — returns the FP4 buffer as-is
+
+
 class DeepSeekV4LayerItem(NamedTuple):
     compress_ratio: Literal[0, 4, 128]
     compress_layer_id: int
@@ -466,7 +590,12 @@ class DeepSeekV4TokenToKVPool(KVCache):
             enable_memory_saver,
         )
 
-        self.c4_indexer_kv_pool = DeepSeekV4IndexerPool(
+        _IndexerPoolCls = (
+            DeepSeekV4IndexerPoolFP4
+            if envs.SGLANG_OPT_USE_TILELANG_INDEXER_FP4.get()
+            else DeepSeekV4IndexerPool
+        )
+        self.c4_indexer_kv_pool = _IndexerPoolCls(
             self.c4_logical_size,
             c4_page_size,
             dtype,
@@ -818,4 +947,18 @@ class DeepSeekV4TokenToKVPool(KVCache):
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
+
+    def set_index_k_fp4_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k_fp4: torch.Tensor,
+        index_k_fe8m0: torch.Tensor,
+    ) -> None:
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+        assert isinstance(self.c4_indexer_kv_pool, DeepSeekV4IndexerPoolFP4)
+        self.c4_indexer_kv_pool.set_index_k_fp4_buffer(
+            compress_layer_id, loc, index_k_fp4, index_k_fe8m0
+        )
 

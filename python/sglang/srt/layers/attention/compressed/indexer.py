@@ -365,20 +365,37 @@ class C4IndexerBackend:
         assert len(c4_indexer_kv_cache.shape) == 2
         block_kv = 64
         num_heads_kv = 1
-        head_dim_with_sf = 132
 
-        c4_indexer_kv_cache = c4_indexer_kv_cache.view(
-            c4_indexer_kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+        if envs.SGLANG_OPT_USE_TILELANG_INDEXER_FP4.get():
+            # FP4 layout: 68 bytes/token = 64 (FP4-packed K) + 4 (FE8M0 scale)
+            head_dim_with_sf = 68
+            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                c4_indexer_kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
+            from sglang.jit_kernel.deepseek_v4 import (
+                tilelang_fp4_paged_mqa_logits as fn,
+            )
+        elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+            head_dim_with_sf = 132
+            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                c4_indexer_kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+            head_dim_with_sf = 132
+            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                c4_indexer_kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
             fn = fp8_paged_mqa_logits_torch
         else:
+            head_dim_with_sf = 132
+            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                c4_indexer_kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
             if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
                 from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
                     fp8_paged_mqa_logits_chunked as fn,
@@ -387,8 +404,9 @@ class C4IndexerBackend:
                 from deep_gemm import fp8_paged_mqa_logits as fn
 
         _c4sl = indexer_metadata.c4_seq_lens
-        if _c4sl.dim() == 1:
-            _c4sl = _c4sl.unsqueeze(-1)
+        if not envs.SGLANG_OPT_USE_TILELANG_INDEXER_FP4.get():
+            if _c4sl.dim() == 1:
+                _c4sl = _c4sl.unsqueeze(-1)
         logits = fn(
             q_fp8,
             c4_indexer_kv_cache,
