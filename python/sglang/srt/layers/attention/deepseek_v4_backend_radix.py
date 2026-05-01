@@ -151,85 +151,6 @@ def _dsv4_shift_valid_indices(indices: torch.Tensor, offset: int) -> torch.Tenso
     return torch.where(indices >= 0, indices + offset, indices)
 
 
-@triton.jit
-def _dsv4_compact_two_source_indices_kernel(
-    swa_indices,
-    extra_indices,
-    swa_lengths,
-    extra_lengths,
-    out_indices,
-    out_lengths,
-    extra_offset: tl.constexpr,
-    swa_topk: tl.constexpr,
-    extra_topk: tl.constexpr,
-    out_topk: tl.constexpr,
-    block_size: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offs = tl.arange(0, block_size)
-    mask = offs < out_topk
-
-    swa_len = tl.load(swa_lengths + row)
-    extra_len = tl.load(extra_lengths + row)
-    swa_len = tl.minimum(tl.maximum(swa_len, 0), swa_topk)
-    extra_len = tl.minimum(tl.maximum(extra_len, 0), extra_topk)
-    total_len = tl.minimum(swa_len + extra_len, out_topk)
-
-    is_swa = offs < swa_len
-    is_extra = (offs >= swa_len) & (offs < total_len)
-
-    swa_src = tl.load(
-        swa_indices + row * swa_topk + offs,
-        mask=mask & is_swa,
-        other=-1,
-    )
-    extra_offs = offs - swa_len
-    extra_src = tl.load(
-        extra_indices + row * extra_topk + extra_offs,
-        mask=mask & is_extra,
-        other=-1,
-    )
-    extra_src = tl.where(extra_src >= 0, extra_src + extra_offset, extra_src)
-    out = tl.where(is_swa, swa_src, tl.where(is_extra, extra_src, -1))
-
-    tl.store(out_indices + row * out_topk + offs, out, mask=mask)
-    tl.store(out_lengths + row, total_len)
-
-
-def _dsv4_compact_two_source_indices(
-    swa_indices: torch.Tensor,
-    extra_indices: torch.Tensor,
-    swa_topk_lengths: torch.Tensor,
-    extra_topk_lengths: torch.Tensor,
-    extra_offset: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert swa_indices.ndim == 3 and extra_indices.ndim == 3
-    assert swa_indices.shape[1] == 1 and extra_indices.shape[1] == 1
-    num_tokens = swa_indices.shape[0]
-    swa_topk = swa_indices.shape[-1]
-    extra_topk = extra_indices.shape[-1]
-    out_topk = ceil_align(swa_topk + extra_topk, 128)
-    out_indices = torch.empty(
-        (num_tokens, 1, out_topk), dtype=swa_indices.dtype, device=swa_indices.device
-    )
-    out_lengths = torch.empty((num_tokens,), dtype=torch.int32, device=swa_indices.device)
-    block_size = triton.next_power_of_2(out_topk)
-    _dsv4_compact_two_source_indices_kernel[(num_tokens,)](
-        swa_indices.contiguous(),
-        extra_indices.contiguous(),
-        swa_topk_lengths.contiguous(),
-        extra_topk_lengths.contiguous(),
-        out_indices,
-        out_lengths,
-        extra_offset,
-        swa_topk,
-        extra_topk,
-        out_topk,
-        block_size,
-    )
-    return out_indices, out_lengths
-
-
 def _dsv4_pad_indices_last_dim(
     indices: torch.Tensor, multiple: int = 128
 ) -> torch.Tensor:
@@ -1202,12 +1123,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
     ) -> None:
         raw_loc = forward_batch.out_cache_loc
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            if getattr(self.token_to_kv_pool, "enable_bf16_direct_prefill", False):
-                self.token_to_kv_pool.set_direct_bf16_prefill_swa_key_buffer(
-                    layer_id=layer_id,
-                    raw_loc=raw_loc,
-                    cache_k=swa_k,
-                )
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
                 raw_loc=raw_loc,
