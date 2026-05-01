@@ -211,52 +211,169 @@ def _dsv4_dequantize_model1_fp8_sparse_k_cache_kernel(
     block_size: tl.constexpr,
     DIM_NOPE: tl.constexpr,
     DIM_ROPE: tl.constexpr,
-    TILE_SIZE: tl.constexpr,
-    NUM_TILES: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
     VALUE_BYTES_PER_TOKEN: tl.constexpr,
+    VALUE_BF16_PER_TOKEN: tl.constexpr,
     SCALE_BYTES_PER_TOKEN: tl.constexpr,
     SCALE_BIAS: tl.constexpr,
 ):
     token_linear = tl.program_id(0)
     block_id = token_linear // block_size
     token_offset = token_linear - block_id * block_size
-    raw_block_id = tl.program_id(1)
     out_token_id = out_token_offset + token_linear
 
-    offsets = tl.arange(0, TILE_SIZE)
+    offsets = tl.arange(0, BLOCK_DIM)
+    nope_mask = offsets < DIM_NOPE
+    rope_mask = (offsets >= DIM_NOPE) & (offsets < DIM_NOPE + DIM_ROPE)
 
-    if raw_block_id < NUM_TILES:
-        dim_offsets = raw_block_id * TILE_SIZE + offsets
-        src_offsets = (
-            block_id * k_stride_0
-            + token_offset * VALUE_BYTES_PER_TOKEN
-            + dim_offsets
-        )
-        x_fp32 = tl.load(k_cache_fp8_ptr + src_offsets).to(tl.float32)
+    value_base = block_id * k_stride_0 + token_offset * VALUE_BYTES_PER_TOKEN
+    x_fp32 = tl.load(
+        k_cache_fp8_ptr + value_base + offsets,
+        mask=nope_mask,
+        other=0.0,
+    ).to(tl.float32)
 
-        scale_offset = (
-            block_id * k_stride_0
-            + block_size * VALUE_BYTES_PER_TOKEN
-            + token_offset * SCALE_BYTES_PER_TOKEN
-            + raw_block_id
-        )
-        scale_u8 = tl.load(k_cache_u8_ptr + scale_offset).to(tl.float32)
-        scale = tl.exp2(scale_u8 - SCALE_BIAS)
-        y = (x_fp32 * scale).to(out_ptr.dtype.element_ty)
+    scale_offsets = (
+        block_id * k_stride_0
+        + block_size * VALUE_BYTES_PER_TOKEN
+        + token_offset * SCALE_BYTES_PER_TOKEN
+        + offsets // 64
+    )
+    scale_u8 = tl.load(
+        k_cache_u8_ptr + scale_offsets,
+        mask=nope_mask,
+        other=127,
+    ).to(tl.float32)
+    y_nope = (x_fp32 * tl.exp2(scale_u8 - SCALE_BIAS)).to(out_ptr.dtype.element_ty)
 
-        dst_offsets = out_token_id * out_stride_0 + dim_offsets
-        tl.store(out_ptr + dst_offsets, y)
-    else:
-        src_offsets = (
-            block_id * k_bf16_stride_0
-            + token_offset * (VALUE_BYTES_PER_TOKEN // 2)
-            + (DIM_NOPE // 2)
-            + offsets
-        )
-        y = tl.load(k_cache_bf16_ptr + src_offsets)
+    rope_offsets = (
+        block_id * k_bf16_stride_0
+        + token_offset * VALUE_BF16_PER_TOKEN
+        + (DIM_NOPE // 2)
+        + (offsets - DIM_NOPE)
+    )
+    y_rope = tl.load(k_cache_bf16_ptr + rope_offsets, mask=rope_mask, other=0.0)
 
-        dst_offsets = out_token_id * out_stride_0 + DIM_NOPE + offsets
-        tl.store(out_ptr + dst_offsets, y)
+    y = tl.where(nope_mask, y_nope, y_rope)
+    tl.store(
+        out_ptr + out_token_id * out_stride_0 + offsets,
+        y,
+        mask=offsets < DIM_NOPE + DIM_ROPE,
+    )
+
+
+@triton.jit
+def _dsv4_dequantize_two_model1_fp8_sparse_k_caches_kernel(
+    swa_k_cache_fp8_ptr,
+    swa_k_cache_bf16_ptr,
+    swa_k_cache_u8_ptr,
+    extra_k_cache_fp8_ptr,
+    extra_k_cache_bf16_ptr,
+    extra_k_cache_u8_ptr,
+    out_ptr,
+    swa_num_tokens,
+    swa_k_stride_0: tl.constexpr,
+    swa_k_bf16_stride_0: tl.constexpr,
+    extra_k_stride_0: tl.constexpr,
+    extra_k_bf16_stride_0: tl.constexpr,
+    out_stride_0: tl.constexpr,
+    SWA_BLOCK_SIZE: tl.constexpr,
+    EXTRA_BLOCK_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    VALUE_BYTES_PER_TOKEN: tl.constexpr,
+    VALUE_BF16_PER_TOKEN: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    SCALE_BIAS: tl.constexpr,
+):
+    token_linear = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_DIM)
+    is_extra = token_linear >= swa_num_tokens
+    nope_mask = offsets < DIM_NOPE
+    rope_mask = (offsets >= DIM_NOPE) & (offsets < DIM_NOPE + DIM_ROPE)
+
+    swa_block_id = token_linear // SWA_BLOCK_SIZE
+    swa_token_offset = token_linear - swa_block_id * SWA_BLOCK_SIZE
+    extra_token_linear = token_linear - swa_num_tokens
+    extra_block_id = extra_token_linear // EXTRA_BLOCK_SIZE
+    extra_token_offset = extra_token_linear - extra_block_id * EXTRA_BLOCK_SIZE
+
+    swa_value_base = (
+        swa_block_id * swa_k_stride_0 + swa_token_offset * VALUE_BYTES_PER_TOKEN
+    )
+    extra_value_base = (
+        extra_block_id * extra_k_stride_0
+        + extra_token_offset * VALUE_BYTES_PER_TOKEN
+    )
+    x_swa = tl.load(
+        swa_k_cache_fp8_ptr + swa_value_base + offsets,
+        mask=(~is_extra) & nope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_extra = tl.load(
+        extra_k_cache_fp8_ptr + extra_value_base + offsets,
+        mask=is_extra & nope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_fp32 = tl.where(is_extra, x_extra, x_swa)
+
+    scale_offsets = offsets // 64
+    swa_scale_offsets = (
+        swa_block_id * swa_k_stride_0
+        + SWA_BLOCK_SIZE * VALUE_BYTES_PER_TOKEN
+        + swa_token_offset * SCALE_BYTES_PER_TOKEN
+        + scale_offsets
+    )
+    extra_scale_offsets = (
+        extra_block_id * extra_k_stride_0
+        + EXTRA_BLOCK_SIZE * VALUE_BYTES_PER_TOKEN
+        + extra_token_offset * SCALE_BYTES_PER_TOKEN
+        + scale_offsets
+    )
+    scale_swa = tl.load(
+        swa_k_cache_u8_ptr + swa_scale_offsets,
+        mask=(~is_extra) & nope_mask,
+        other=127,
+    ).to(tl.float32)
+    scale_extra = tl.load(
+        extra_k_cache_u8_ptr + extra_scale_offsets,
+        mask=is_extra & nope_mask,
+        other=127,
+    ).to(tl.float32)
+    scale_u8 = tl.where(is_extra, scale_extra, scale_swa)
+    y_nope = (x_fp32 * tl.exp2(scale_u8 - SCALE_BIAS)).to(out_ptr.dtype.element_ty)
+
+    swa_rope_offsets = (
+        swa_block_id * swa_k_bf16_stride_0
+        + swa_token_offset * VALUE_BF16_PER_TOKEN
+        + (DIM_NOPE // 2)
+        + (offsets - DIM_NOPE)
+    )
+    extra_rope_offsets = (
+        extra_block_id * extra_k_bf16_stride_0
+        + extra_token_offset * VALUE_BF16_PER_TOKEN
+        + (DIM_NOPE // 2)
+        + (offsets - DIM_NOPE)
+    )
+    y_rope_swa = tl.load(
+        swa_k_cache_bf16_ptr + swa_rope_offsets,
+        mask=(~is_extra) & rope_mask,
+        other=0.0,
+    )
+    y_rope_extra = tl.load(
+        extra_k_cache_bf16_ptr + extra_rope_offsets,
+        mask=is_extra & rope_mask,
+        other=0.0,
+    )
+    y_rope = tl.where(is_extra, y_rope_extra, y_rope_swa)
+
+    y = tl.where(nope_mask, y_nope, y_rope)
+    tl.store(
+        out_ptr + token_linear * out_stride_0 + offsets,
+        y,
+        mask=offsets < DIM_NOPE + DIM_ROPE,
+    )
 
 
 def _dsv4_get_k_cache_fp8_view(k_cache: torch.Tensor) -> torch.Tensor:
@@ -285,10 +402,8 @@ def _dsv4_dequantize_model1_fp8_sparse_k_cache_into(
     k_cache_u8 = k_cache_fp8.view(torch.uint8)
 
     # DSV4 pages store all 576-byte token values first, then 8 scale bytes per token.
-    d_nope, d_rope, tile_size, num_tiles = 448, 64, 64, 7
-    _dsv4_dequantize_model1_fp8_sparse_k_cache_kernel[
-        (num_tokens, num_tiles + 1)
-    ](
+    d_nope, d_rope, block_dim = 448, 64, 512
+    _dsv4_dequantize_model1_fp8_sparse_k_cache_kernel[(num_tokens,)](
         k_cache_fp8,
         k_cache_bf16,
         k_cache_u8,
@@ -300,11 +415,71 @@ def _dsv4_dequantize_model1_fp8_sparse_k_cache_into(
         block_size,
         DIM_NOPE=d_nope,
         DIM_ROPE=d_rope,
-        TILE_SIZE=tile_size,
-        NUM_TILES=num_tiles,
+        BLOCK_DIM=block_dim,
         VALUE_BYTES_PER_TOKEN=d_nope + 2 * d_rope,
-        SCALE_BYTES_PER_TOKEN=num_tiles + 1,
+        VALUE_BF16_PER_TOKEN=(d_nope + 2 * d_rope) // 2,
+        SCALE_BYTES_PER_TOKEN=8,
         SCALE_BIAS=127.0,
+        num_warps=4,
+    )
+
+
+def _dsv4_dequantize_two_model1_fp8_sparse_k_caches_into(
+    swa_k_cache: torch.Tensor,
+    extra_k_cache: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    swa_num_blocks, swa_block_size, swa_h_k, swa_dim_quant = swa_k_cache.shape
+    extra_num_blocks, extra_block_size, extra_h_k, extra_dim_quant = extra_k_cache.shape
+    assert swa_h_k == 1 and extra_h_k == 1
+    assert swa_dim_quant == 584 and extra_dim_quant == 584
+    assert out.dtype == torch.bfloat16
+    assert out.shape[-1] == 512
+
+    swa_num_tokens = swa_num_blocks * swa_block_size
+    extra_num_tokens = extra_num_blocks * extra_block_size
+    assert out.shape[0] >= swa_num_tokens + extra_num_tokens
+    if swa_num_tokens == 0:
+        _dsv4_dequantize_model1_fp8_sparse_k_cache_into(extra_k_cache, out, 0)
+        return
+    if extra_num_tokens == 0:
+        _dsv4_dequantize_model1_fp8_sparse_k_cache_into(swa_k_cache, out, 0)
+        return
+
+    swa_k_cache_fp8 = _dsv4_get_k_cache_fp8_view(swa_k_cache)
+    swa_k_cache_bf16 = swa_k_cache_fp8.view(torch.bfloat16)
+    swa_k_cache_u8 = swa_k_cache_fp8.view(torch.uint8)
+    extra_k_cache_fp8 = _dsv4_get_k_cache_fp8_view(extra_k_cache)
+    extra_k_cache_bf16 = extra_k_cache_fp8.view(torch.bfloat16)
+    extra_k_cache_u8 = extra_k_cache_fp8.view(torch.uint8)
+
+    d_nope, d_rope, block_dim = 448, 64, 512
+    _dsv4_dequantize_two_model1_fp8_sparse_k_caches_kernel[
+        (swa_num_tokens + extra_num_tokens,)
+    ](
+        swa_k_cache_fp8,
+        swa_k_cache_bf16,
+        swa_k_cache_u8,
+        extra_k_cache_fp8,
+        extra_k_cache_bf16,
+        extra_k_cache_u8,
+        out,
+        swa_num_tokens,
+        swa_k_cache_fp8.stride(0),
+        swa_k_cache_bf16.stride(0),
+        extra_k_cache_fp8.stride(0),
+        extra_k_cache_bf16.stride(0),
+        out.stride(0),
+        SWA_BLOCK_SIZE=swa_block_size,
+        EXTRA_BLOCK_SIZE=extra_block_size,
+        DIM_NOPE=d_nope,
+        DIM_ROPE=d_rope,
+        BLOCK_DIM=block_dim,
+        VALUE_BYTES_PER_TOKEN=d_nope + 2 * d_rope,
+        VALUE_BF16_PER_TOKEN=(d_nope + 2 * d_rope) // 2,
+        SCALE_BYTES_PER_TOKEN=8,
+        SCALE_BIAS=127.0,
+        num_warps=4,
     )
 
 
@@ -589,12 +764,13 @@ def _dsv4_build_unified_prefill_inputs_from_real_decode_triton(
         dtype=torch.bfloat16,
         device=q.device,
     )
-    _dsv4_dequantize_model1_fp8_sparse_k_cache_into(
-        swa_k_cache, kv_unified, out_token_offset=0
-    )
-    if extra_k_cache is not None:
+    if extra_k_cache is None:
         _dsv4_dequantize_model1_fp8_sparse_k_cache_into(
-            extra_k_cache, kv_unified, out_token_offset=swa_num_tokens
+            swa_k_cache, kv_unified, out_token_offset=0
+        )
+    else:
+        _dsv4_dequantize_two_model1_fp8_sparse_k_caches_into(
+            swa_k_cache, extra_k_cache, kv_unified
         )
 
     indices_unified = _dsv4_build_unified_prefill_indices_triton(
