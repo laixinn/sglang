@@ -150,6 +150,9 @@ class KVArgsRegisterInfo:
         )
 
 
+_tls = threading.local()
+
+
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
@@ -203,6 +206,7 @@ class MooncakeKVManager(CommonKVManager):
                 threading.Thread(
                     target=self.transfer_worker,
                     args=(
+                        i,
                         queue,
                         executor,
                         (
@@ -558,9 +562,14 @@ class MooncakeKVManager(CommonKVManager):
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
+        _t0 = time.monotonic()
+        ret = self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
+        _elapsed = time.monotonic() - _t0
+        _tls.engine_send_time = getattr(_tls, "engine_send_time", 0.0) + _elapsed
+        _tls.engine_send_bytes = getattr(_tls, "engine_send_bytes", 0) + sum(lengths)
+        return ret
 
     def _send_kvcache_generic(
         self,
@@ -1136,6 +1145,7 @@ class MooncakeKVManager(CommonKVManager):
 
     def transfer_worker(
         self,
+        queue_id: int,
         queue: FastQueue,
         executor: concurrent.futures.ThreadPoolExecutor,
         staging_buffer=None,
@@ -1148,6 +1158,13 @@ class MooncakeKVManager(CommonKVManager):
                 tp_rank=self.attn_tp_rank,
                 dp_rank=self.attn_dp_rank,
             )
+
+        _LOG_INTERVAL_S = 10.0
+        _stats_chunks_sent = 0
+        _stats_busy_time = 0.0
+        _stats_last_log = time.monotonic()
+        _tls.engine_send_time = 0.0
+        _tls.engine_send_bytes = 0
 
         while True:
             try:
@@ -1173,6 +1190,7 @@ class MooncakeKVManager(CommonKVManager):
                             thread_finish_flag=True,
                         )
                     continue
+                _chunk_start = time.monotonic()
 
                 if (
                     self.enable_staging
@@ -1362,6 +1380,41 @@ class MooncakeKVManager(CommonKVManager):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+
+                _chunk_end = time.monotonic()
+                _stats_busy_time += _chunk_end - _chunk_start
+                _stats_chunks_sent += 1
+                if _chunk_end - _stats_last_log >= _LOG_INTERVAL_S:
+                    _send_time = _tls.engine_send_time
+                    _bytes_sent = _tls.engine_send_bytes
+                    _wait_time = _stats_busy_time - _send_time
+                    if _stats_busy_time > 0:
+                        _send_pct = _send_time / _stats_busy_time * 100.0
+                        _wait_pct = _wait_time / _stats_busy_time * 100.0
+                    else:
+                        _send_pct = _wait_pct = 0.0
+                    _speed_gbps = (
+                        (_bytes_sent / _send_time / 1e9) if _send_time > 0 else 0.0
+                    )
+                    logger.info(
+                        "transfer_worker rank=%d queue=%d | "
+                        "wait=%.1f%% send=%.1f%% | "
+                        "send_speed=%.2f GB/s | "
+                        "chunks=%d bytes_sent=%.2f GB busy=%.1fms",
+                        self.attn_tp_rank,
+                        queue_id,
+                        _wait_pct,
+                        _send_pct,
+                        _speed_gbps,
+                        _stats_chunks_sent,
+                        _bytes_sent / 1e9,
+                        _stats_busy_time * 1e3,
+                    )
+                    _tls.engine_send_time = 0.0
+                    _tls.engine_send_bytes = 0
+                    _stats_chunks_sent = 0
+                    _stats_busy_time = 0.0
+                    _stats_last_log = _chunk_end
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
