@@ -69,6 +69,7 @@ class KVArgs:
 
 
 class KVPoll:
+    D2P_Init = -1
     Failed = 0
     Bootstrapping = 1
     WaitingForInput = 2

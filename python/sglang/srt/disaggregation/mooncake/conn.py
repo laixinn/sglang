@@ -167,7 +167,6 @@ class MooncakeKVManager(CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
-        self._d2p_receiver = None
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
@@ -1352,10 +1351,6 @@ class MooncakeKVManager(CommonKVManager):
                     )
 
                     handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
-                    continue
-                if room == "D2P_REQ":
-                    if self._d2p_receiver is not None:
-                        self._d2p_receiver.handle_d2p_request(waiting_req_bytes)
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":

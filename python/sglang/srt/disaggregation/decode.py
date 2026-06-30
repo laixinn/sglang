@@ -1884,3 +1884,6 @@ class SchedulerDisaggregationDecodeMixin:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(transferred_reqs)
+
+        if self.d2p_replicator is not None:
+            self.d2p_replicator.poll_d2p_senders()

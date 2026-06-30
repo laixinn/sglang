@@ -37,7 +37,7 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
-from sglang.srt.managers.disagg_service import start_disagg_service
+from sglang.srt.managers.disagg_service import start_d2p_service, start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     BaseReq,
@@ -382,6 +382,7 @@ class MultiTokenizerRouter:
             print_exception_wrapper(self.handle_loop), self._loop
         )
         self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
+        self.d2p_bootstrap_server = start_d2p_service(self.server_args)
 
         # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: set[str] = set()

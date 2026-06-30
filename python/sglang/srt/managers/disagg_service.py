@@ -43,20 +43,22 @@ def start_disagg_service(
 
         return bootstrap_server
 
-    if (
-        disagg_mode == DisaggregationMode.DECODE
-        and server_args.disaggregation_enable_d2p_kv_replication
-        and transfer_backend == TransferBackend.MOONCAKE
-    ):
-        from sglang.srt.disaggregation.mooncake.d2p import (
-            get_d2p_bootstrap_port,
-        )
 
-        kv_bootstrap_server_class = get_kv_class(
-            transfer_backend, KVClassType.BOOTSTRAP_SERVER
-        )
-        bootstrap_server = kv_bootstrap_server_class(
-            host=server_args.host,
-            port=get_d2p_bootstrap_port(server_args),
-        )
-        return bootstrap_server
+def start_d2p_service(server_args: ServerArgs):
+    """Start D2P bootstrap server on both prefill and decode sides."""
+    if not server_args.disaggregation_enable_d2p_kv_replication:
+        return None
+
+    transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
+    if transfer_backend != TransferBackend.MOONCAKE:
+        return None
+
+    from sglang.srt.disaggregation.mooncake.d2p import (
+        D2PKVBootstrapServer,
+        get_d2p_bootstrap_port,
+    )
+
+    return D2PKVBootstrapServer(
+        host=server_args.host,
+        port=get_d2p_bootstrap_port(server_args),
+    )
