@@ -79,7 +79,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: "SchedulerLogprobResultProcessor"
     output_streamer: "SchedulerOutputStreamer"
     abort_request: Callable
-    d2p_replicator: Optional[Any] = None
+    d2p_send_bootstrap_queue: Optional[Any] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -828,14 +828,6 @@ class SchedulerBatchResultProcessor:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                d2p_replicator = self.d2p_replicator
-                if d2p_replicator is not None and req.req_pool_idx is not None:
-                    req.kv_committed_len_saved = req._cache_commit_len()
-                    logger.info(
-                        f"D2P: saved kv_committed_len={req.kv_committed_len_saved} "
-                        f"for req {req.rid}"
-                    )
-
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 prepare_release = getattr(
@@ -843,13 +835,21 @@ class SchedulerBatchResultProcessor:
                 )
                 if callable(prepare_release):
                     prepare_release(req)
-                release_kv_cache(req, self.tree_cache)
 
-                if d2p_replicator is not None and hasattr(req, "kv_committed_len_saved"):
-                    logger.info(f"D2P: calling capture_and_enqueue for req {req.rid}")
-                    d2p_replicator.capture_and_enqueue(req)
-                elif d2p_replicator is not None:
-                    logger.info(f"D2P: skipped, no kv_committed_len_saved for req {req.rid}")
+                if self.server_args.disaggregation_enable_d2p_kv_replication:
+                    # D2P (decode -> prefill) reuses send_kv_chunk(), which
+                    # reads straight from the live req_to_token_pool slot
+                    # (same as the forward prefill->decode path) so it can
+                    # reuse the SWA/Mamba/DSA state-payload logic unmodified.
+                    # That means req.req_pool_idx must stay allocated until
+                    # the D2P sender has actually consumed it, so
+                    # release_kv_cache() is NOT called here. It is deferred
+                    # until the transfer is polled to completion (or fails)
+                    # in process_d2p_send_inflight_queue(), or immediately if
+                    # bootstrap itself fails (handle_bootstrap_failure()).
+                    req.is_d2p = True
+                else:
+                    release_kv_cache(req, self.tree_cache)
 
             req.time_stats.set_completion_time()
 

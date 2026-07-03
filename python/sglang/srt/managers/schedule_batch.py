@@ -975,6 +975,9 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
+        # D2P
+        self.is_d2p = False
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""

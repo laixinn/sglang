@@ -177,6 +177,14 @@ class PromptTokensDetails(BaseModel):
     """Details about prompt tokens."""
 
     cached_tokens: int = 0
+    disagg_prefill_prefix_len: Optional[int] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.disagg_prefill_prefix_len is None:
+            data.pop("disagg_prefill_prefix_len", None)
+        return data
 
 
 class UsageInfo(BaseModel):

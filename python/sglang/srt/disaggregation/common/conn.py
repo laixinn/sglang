@@ -106,7 +106,10 @@ class CommonKVManager(BaseKVManager):
         self.server_args = server_args
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
-        self.bootstrap_port = server_args.disaggregation_bootstrap_port
+        self.bootstrap_port = (
+            getattr(args, "bootstrap_port_override", None)
+            or server_args.disaggregation_bootstrap_port
+        )
         self.dist_init_addr = server_args.dist_init_addr
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()

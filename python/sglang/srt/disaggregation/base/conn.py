@@ -66,6 +66,15 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Overrides `server_args.disaggregation_bootstrap_port` for this
+    # manager's register_to_bootstrap()/bootstrap server lookups. Used by
+    # D2P (decode->prefill) KV replication: the D2P sender role-manager is
+    # PREFILL-tagged (so it self-registers on construction) but runs
+    # inside the physical decode process, so it must register to the
+    # separate decode-side D2P bootstrap server instead of the "real"
+    # prefill->decode bootstrap server. Left unset (getattr default None)
+    # by every non-D2P construction site, which keeps the default port.
+    bootstrap_port_override: Optional[int]
 
 
 class KVPoll:

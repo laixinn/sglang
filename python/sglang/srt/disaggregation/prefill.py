@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
@@ -38,6 +40,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _is_fake_transfer,
     get_kv_class,
     is_aborted,
     is_mla_backend,
@@ -56,6 +59,7 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
     maybe_cache_unfinished_req,
+    page_align_floor,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -65,6 +69,7 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
@@ -95,6 +100,24 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
+
+
+def insert_into_radix_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Commit a D2P-received request's KV cache into the prefill radix cache.
+
+    Called once a D2P (decode->prefill) KV transfer has completed and the
+    request's full (prompt + decode-generated) token sequence has real KV
+    data resident in ``req_to_token_pool`` at ``req.req_pool_idx``.
+
+    Reuses the same ``cache_finished_req`` path as a normal finished
+    request: it matches/inserts ``origin_input_ids + output_ids`` into the
+    tree, frees any duplicate KV indices already covered by an existing
+    prefix, and releases the request's pool slot.
+    """
+    # The received sequence (prompt + replicated decode output) is fully
+    # resident in the KV pool at this point, so the whole thing is committed.
+    req.kv_committed_len = len(req.origin_input_ids) + len(req.output_ids)
+    release_kv_cache(req, tree_cache)
 
 
 class PrefillBootstrapQueue:
@@ -147,6 +170,12 @@ class PrefillBootstrapQueue:
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
+        # Registers this manager to self.bootstrap_port (see __init__) rather
+        # than always server_args.disaggregation_bootstrap_port: for the D2P
+        # (decode->prefill) sender role, self.bootstrap_port is the separate
+        # decode-side D2P bootstrap server's port, not the forward prefill
+        # bootstrap server's port that server_args carries.
+        kv_args.bootstrap_port_override = self.bootstrap_port
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
@@ -267,11 +296,32 @@ class PrefillBootstrapQueue:
             return False
 
         req.time_stats.set_bootstrap_done_time()
-        num_kv_indices = len(req.origin_input_ids)
 
-        decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
-        req.start_send_idx = decode_prefix_len
-        num_kv_indices_to_send = num_kv_indices - decode_prefix_len
+        if req.is_d2p:
+            # D2P (decode -> prefill) sends the decode-generated OUTPUT
+            # region, not the prompt: [start, total_len). This is read
+            # directly from the still-live req_to_token_pool slot (send
+            # happens before release_kv_cache() frees it -- see
+            # _handle_finished_req()), exactly like the forward
+            # prefill->decode path, so the same alignment rule applies:
+            # only start needs to be page-aligned (kv_to_page_indices()
+            # requires every page_size-run of kv indices to be one page,
+            # but tolerates a partial *last* page). There is no
+            # decode-side prefix negotiation (that concept only applies to
+            # the forward direction), so start is aligned down from
+            # len(origin_input_ids) -- resending the last partial prompt
+            # page redundantly, which is harmless since prefill already
+            # has it -- and the whole output region is sent in one shot.
+            page_size = self.token_to_kv_pool.page_size
+            req.start_send_idx = page_align_floor(len(req.origin_input_ids), page_size)
+            total_len = len(req.origin_input_ids) + len(req.output_ids)
+            num_kv_indices_to_send = max(0, total_len - req.start_send_idx)
+        else:
+            num_kv_indices = len(req.origin_input_ids)
+            decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
+            req.start_send_idx = decode_prefix_len
+            num_kv_indices_to_send = num_kv_indices - decode_prefix_len
+
         num_pages = kv_to_page_num(
             num_kv_indices_to_send, self.token_to_kv_pool.page_size
         )
@@ -377,6 +427,50 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs
         else:
             return bootstrapped_reqs, failed_reqs
+        
+    def _resolve_pending_reqs(self, reqs: List[Req]) -> None:
+        """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
+        if not self.pending_reqs:
+            return
+
+        # Group pending requests by bootstrap_addr
+        addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
+        for decode_req in self.pending_reqs:
+            addr = _bootstrap_addr(decode_req.req)
+            addr_to_reqs.setdefault(addr, []).append(decode_req)
+
+        # Pass 1: ensure parallel info for each addr
+        ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
+
+        resolved: List[Tuple[DecodeRequest, int]] = []
+        for bootstrap_addr, decode_reqs in ready_addrs.items():
+            need_query: List[DecodeRequest] = []
+            for decode_req in decode_reqs:
+                prefill_dp_rank = self._resolve_prefill_dp_rank(decode_req.req)
+                if prefill_dp_rank is not None:
+                    resolved.append((decode_req, prefill_dp_rank))
+                else:
+                    need_query.append(decode_req)
+
+            # Pass 2: resolve dp rank for addrs whose info is available
+            if need_query:
+                rooms = [decode_req.req.bootstrap_room for decode_req in need_query]
+                room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
+                    bootstrap_addr, rooms
+                )
+                for decode_req in need_query:
+                    prefill_dp_rank = room_to_rank.get(
+                        str(decode_req.req.bootstrap_room)
+                    )
+                    if prefill_dp_rank is not None:
+                        resolved.append((decode_req, int(prefill_dp_rank)))
+                    else:
+                        remaining.append(decode_req)
+
+        self.pending_reqs = remaining
+
+        for decode_req, prefill_dp_rank in resolved:
+            decode_req.kv_receiver.init(prefill_dp_rank)
 
 
 class SchedulerDisaggregationPrefillMixin:
@@ -412,6 +506,17 @@ class SchedulerDisaggregationPrefillMixin:
 
         return batch
 
+    def process_d2p_queue(self: Scheduler):
+        """Process D2P receiver queues on the prefill side. Forked from process_decode_queue."""
+        req_conns, _ = self.d2p_recv_prealloc_queue.pop_preallocated()
+        self.d2p_recv_transfer_queue.extend(req_conns)
+        transferred_reqs = (
+            self.d2p_recv_transfer_queue.pop_transferred()
+        )  # the requests which kv has arrived
+
+        for req in transferred_reqs:
+            insert_into_radix_cache(req, self.tree_cache)
+
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
@@ -421,6 +526,8 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self.enable_d2p:
+                self.process_d2p_queue()
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -442,9 +549,6 @@ class SchedulerDisaggregationPrefillMixin:
 
             self.process_disagg_prefill_inflight_queue()
 
-            if self.d2p_receiver is not None:
-                self.d2p_receiver.process_d2p_incoming()
-
             # Update last_batch
             self.last_batch = batch
 
@@ -457,6 +561,8 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self.enable_d2p:
+                self.process_d2p_queue()
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -489,9 +595,6 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
-
-            if self.d2p_receiver is not None:
-                self.d2p_receiver.process_d2p_incoming()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -784,6 +887,10 @@ class SchedulerDisaggregationPrefillMixin:
                 if "speed_gb_s" in metrics:
                     self.metrics_reporter.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
+            if self.enable_d2p:
+                req.is_d2p = True
+                self.d2p_recv_prealloc_queue.add(req)
+
         # Stream requests which have finished transfer
         self.output_streamer.stream_output(
             done_reqs,
@@ -832,6 +939,11 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
             release_kv_cache(req, self.tree_cache)
+        # D2P (decode -> prefill) requests share the same
+        # req_to_metadata_buffer_idx_allocator / disagg_metadata_buffers
+        # pool as the forward P->D path (the pool is sized with headroom
+        # for both directions), so a single allocator is used regardless
+        # of req.is_d2p.
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -919,10 +1031,25 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        metadata_buffers: Optional[MetadataBuffers] = None,
+        kv_manager: Optional[CommonKVManager] = None,
     ) -> None:
         """
-        Send a prefilled chunk to the decode server
+        Send a prefilled chunk to the decode server.
+
+        metadata_buffers / kv_manager default to the forward prefill->decode
+        instances (self.disagg_metadata_buffers /
+        self.disagg_prefill_bootstrap_queue.kv_manager). D2P (decode->prefill)
+        reuses the same self.disagg_metadata_buffers pool but passes its own
+        d2p_send_bootstrap_queue.kv_manager, so this function can be reused
+        unmodified for the reverse direction, including SWA/Mamba/DSA state
+        payloads.
         """
+        if metadata_buffers is None:
+            metadata_buffers = self.disagg_metadata_buffers
+        if kv_manager is None:
+            kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
+
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         end_idx = (
@@ -951,9 +1078,9 @@ class SchedulerDisaggregationPrefillMixin:
         )
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            metadata_buffers.set_buf(req)
 
-            seq_len = len(req.fill_ids)
+            seq_len = end_idx
 
             def _mamba_payload():
                 return [
@@ -986,9 +1113,7 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
 
-            state_types = (
-                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
-            )
+            state_types = kv_manager.kv_args.state_types
             state_indices = []
             for st in state_types:
                 if st == StateType.MAMBA:

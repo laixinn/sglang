@@ -78,3 +78,6 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
                 f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                 f"got '{server_args.disaggregation_transfer_backend}'."
             )
+
+    if server_args.disaggregation_enable_d2p_kv_replication:
+        server_args.disaggregation_d2p_bootstrap_port = server_args.disaggregation_bootstrap_port + 1

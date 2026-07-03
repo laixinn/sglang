@@ -10,9 +10,15 @@ class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
-        """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
-        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
+    def _build_details(
+        cached: int, disagg_prefill_prefix_len: Optional[int] = None
+    ) -> Optional[PromptTokensDetails]:
+        if cached <= 0 and disagg_prefill_prefix_len is None:
+            return None
+        return PromptTokensDetails(
+            cached_tokens=cached,
+            disagg_prefill_prefix_len=disagg_prefill_prefix_len,
+        )
 
     @staticmethod
     def calculate_response_usage(
@@ -39,7 +45,18 @@ class UsageProcessor:
                 responses[i]["meta_info"].get("cached_tokens", 0)
                 for i in range(0, len(responses), n_choices)
             )
-            cached_details = UsageProcessor._details_if_cached(cached_total)
+            disagg_vals = [
+                responses[i]["meta_info"].get("disagg_prefill_prefix_len")
+                for i in range(0, len(responses), n_choices)
+            ]
+            disagg_total = (
+                sum(v for v in disagg_vals if v is not None)
+                if any(v is not None for v in disagg_vals)
+                else None
+            )
+            cached_details = UsageProcessor._build_details(
+                cached_total, disagg_total
+            )
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -56,6 +73,7 @@ class UsageProcessor:
         cached_tokens: Mapping[int, int],
         n_choices: int,
         enable_cache_report: bool = False,
+        disagg_prefill_prefix_lens: Optional[Mapping[int, Optional[int]]] = None,
     ) -> UsageInfo:
         # index % n_choices == 0 marks the first choice of a prompt
         total_prompt_tokens = sum(
@@ -64,13 +82,23 @@ class UsageProcessor:
         total_reasoning_tokens = sum(reasoning_tokens.values())
         total_completion_tokens = sum(completion_tokens.values())
 
-        cached_details = (
-            UsageProcessor._details_if_cached(
-                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
+        cached_details = None
+        if enable_cache_report:
+            cached_total = sum(
+                tok for idx, tok in cached_tokens.items() if idx % n_choices == 0
             )
-            if enable_cache_report
-            else None
-        )
+            disagg_total = None
+            if disagg_prefill_prefix_lens:
+                vals = [
+                    v
+                    for idx, v in disagg_prefill_prefix_lens.items()
+                    if idx % n_choices == 0 and v is not None
+                ]
+                if vals:
+                    disagg_total = sum(vals)
+            cached_details = UsageProcessor._build_details(
+                cached_total, disagg_total
+            )
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,

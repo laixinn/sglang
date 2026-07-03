@@ -1056,6 +1056,8 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
             buffer_size = (self.req_to_token_pool.size) * 2
+            if self.server_args.disaggregation_enable_d2p_kv_replication:
+                buffer_size *= 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
@@ -1106,9 +1108,34 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
+            if self.server_args.disaggregation_enable_d2p_kv_replication:
+                self.d2p_send_bootstrap_queue = PrefillBootstrapQueue(
+                    token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
+                    draft_token_to_kv_pool=None,
+                    req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+                    metadata_buffers=self.disagg_metadata_buffers,
+                    tp_rank=self.ps.tp_rank,
+                    tp_size=self.ps.tp_size,
+                    gpu_id=self.ps.gpu_id,
+                    # D2P sends register to the decode-side D2P bootstrap
+                    # server (started in start_d2p_service()), not the
+                    # forward prefill bootstrap server on
+                    # disaggregation_bootstrap_port.
+                    bootstrap_port=self.server_args.disaggregation_d2p_bootstrap_port,
+                    gloo_group=self.attn_tp_cpu_group,
+                    max_total_num_tokens=self.max_total_num_tokens,
+                    scheduler=self,
+                    pp_rank=self.ps.pp_rank,
+                    pp_size=self.ps.pp_size,
+                    transfer_backend=self.transfer_backend,
+                )
+                self.d2p_send_inflight_queue: List[Req] = []
+
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
+            if self.server_args.disaggregation_enable_d2p_kv_replication:
+                buffer_size *= 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
@@ -1148,36 +1175,38 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
-        # D2P KV cache replication
-        self.d2p_replicator = None
-        self.d2p_receiver = None
-        if (
-            self.server_args.disaggregation_enable_d2p_kv_replication
-            and self.transfer_backend == TransferBackend.MOONCAKE
-        ):
-            from sglang.srt.disaggregation.mooncake.d2p import (
-                D2PKVManager,
-                _build_reverse_kv_args,
-            )
+            if self.server_args.disaggregation_enable_d2p_kv_replication:
+                self.d2p_recv_transfer_queue = DecodeTransferQueue(
+                    gloo_group=self.attn_tp_cpu_group,
+                    req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+                    tp_rank=self.ps.tp_rank,
+                    metadata_buffers=self.disagg_metadata_buffers,
+                    scheduler=self,
+                    tree_cache=self.tree_cache,
+                )
 
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                kv_mgr = self.disagg_decode_prealloc_queue.kv_manager
-                kv_args = _build_reverse_kv_args(self, kv_mgr)
-                d2p_mgr = D2PKVManager(
-                    kv_args, DisaggregationMode.PREFILL,
-                    self.server_args, kv_mgr.is_mla_backend,
+                self.d2p_recv_prealloc_queue = DecodePreallocQueue(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    draft_token_to_kv_pool=None,
+                    req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+                    metadata_buffers=self.disagg_metadata_buffers,
+                    scheduler=self,
+                    transfer_queue=self.d2p_recv_transfer_queue,
+                    tree_cache=self.tree_cache,
+                    gloo_group=self.attn_tp_cpu_group,
+                    tp_rank=self.ps.tp_rank,
+                    tp_size=self.ps.tp_size,
+                    dp_size=self.server_args.dp_size,
+                    gpu_id=self.ps.gpu_id,
+                    bootstrap_port=self.server_args.disaggregation_d2p_bootstrap_port,
+                    max_total_num_tokens=self.max_total_num_tokens,
+                    pp_rank=self.ps.pp_rank,
+                    num_reserved_decode_tokens=0,
+                    transfer_backend=self.transfer_backend,
                 )
-                d2p_mgr.init_d2p_sender(self)
-                self.d2p_replicator = d2p_mgr
-            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-                kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
-                kv_args = _build_reverse_kv_args(self, kv_mgr)
-                d2p_mgr = D2PKVManager(
-                    kv_args, DisaggregationMode.DECODE,
-                    self.server_args, kv_mgr.is_mla_backend,
-                )
-                d2p_mgr.init_d2p_receiver(self)
-                self.d2p_receiver = d2p_mgr
+
+        self.enable_d2p = self.server_args.disaggregation_enable_d2p_kv_replication
 
         # Init mm receiver for EPD disaggregation mode
         if (
@@ -1778,7 +1807,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
-            d2p_replicator=getattr(self, "d2p_replicator", None),
+            d2p_send_bootstrap_queue=getattr(self, "d2p_send_bootstrap_queue", None),
         )
 
     def init_req_max_new_tokens(self, req):
@@ -3205,6 +3234,11 @@ class Scheduler(
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
+            for req in batch.reqs:
+                if req.is_d2p:
+                    self.d2p_send_bootstrap_queue.add(
+                        req, self.model_config.num_key_value_heads
+                    )
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
@@ -3341,8 +3375,9 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
-                if self.d2p_receiver is not None:
-                    idle &= len(self.d2p_receiver._allocated_rooms) == 0
+                if self.enable_d2p:
+                    idle &= len(self.d2p_recv_prealloc_queue.queue) == 0
+                    idle &= len(self.d2p_recv_transfer_queue.queue) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0

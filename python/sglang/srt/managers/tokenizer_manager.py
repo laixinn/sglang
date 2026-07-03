@@ -467,7 +467,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         # Keep a reference so the bootstrap server is not garbage-collected.
         self.bootstrap_server = start_disagg_service(self.server_args)
-        self.d2p_bootstrap_server = start_d2p_service(self.server_args)
+        if self.server_args.disaggregation_enable_d2p_kv_replication:
+            self.d2p_bootstrap_server = start_d2p_service(self.server_args)
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 

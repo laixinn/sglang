@@ -1483,6 +1483,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
+        if decode_req.req.is_d2p:
+            # D2P (decode -> prefill) delivers the KV for an already-complete
+            # (origin_input_ids + output_ids) sequence -- there is no new
+            # token being generated here, so none of the forward P->D
+            # "prefill produced token #1, plus its logprobs / prefix-cache
+            # stats" bookkeeping below applies. The metadata buffer was only
+            # used for the bootstrap_room corruption check above; the actual
+            # KV commit happens in insert_into_radix_cache() (see
+            # process_d2p_queue()).
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
+
         # Case 3: Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
@@ -1677,6 +1690,9 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
+            if self.enable_d2p:
+                for d2p_req in self.d2p_send_bootstrap_queue.pop_bootstrapped():
+                    self.send_d2p_kv_chunk(d2p_req)
             if self._engine_paused:
                 continue
 
@@ -1692,6 +1708,9 @@ class SchedulerDisaggregationDecodeMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
+            if self.enable_d2p:
+                self.process_d2p_send_inflight_queue()
+
             # Update last_batch
             self.last_batch = batch
 
@@ -1705,6 +1724,9 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
+            if self.enable_d2p:
+                for d2p_req in self.d2p_send_bootstrap_queue.pop_bootstrapped():
+                    self.send_d2p_kv_chunk(d2p_req)
             if self._engine_paused:
                 continue
 
@@ -1729,6 +1751,9 @@ class SchedulerDisaggregationDecodeMixin:
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.on_idle()
+
+            if self.enable_d2p:
+                self.process_d2p_send_inflight_queue()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1885,5 +1910,90 @@ class SchedulerDisaggregationDecodeMixin:
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(transferred_reqs)
 
-        if self.d2p_replicator is not None:
-            self.d2p_replicator.poll_d2p_senders()
+    def process_d2p_send_inflight_queue(self: Scheduler):
+        """Poll D2P send requests (decode→prefill). Forked from process_disagg_prefill_inflight_queue."""
+        # Local import to avoid a module-level circular import between
+        # decode.py and prefill.py (both import each other's helpers).
+        from sglang.srt.disaggregation.prefill import maybe_release_metadata_buffer
+
+        if not self.d2p_send_inflight_queue:
+            return
+
+        done_reqs = []
+
+        polls = poll_and_all_reduce(
+            [req.disagg_kv_sender for req in self.d2p_send_inflight_queue],
+            self.attn_tp_cpu_group,
+        )
+
+        undone_reqs: List[Req] = []
+        for req, poll in zip(self.d2p_send_inflight_queue, polls):
+            if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
+                undone_reqs.append(req)
+            elif poll == KVPoll.Success:
+                # req.req_pool_idx was deliberately kept allocated since
+                # _handle_finished_req() (see send_d2p_kv_chunk()) so
+                # send_kv_chunk() could read live KV/state data for the
+                # D2P transfer. Now that the transfer has actually
+                # succeeded, release it (commits the sequence into the
+                # radix tree, same as a normal finished request).
+                release_kv_cache(req, self.tree_cache)
+                if hasattr(req.disagg_kv_sender, "clear"):
+                    req.disagg_kv_sender.clear()
+                logger.debug(f"D2P send completed for req {req.rid}")
+                done_reqs.append(req)
+            elif poll == KVPoll.Failed:
+                error_message = (
+                    f"D2P send failed for request rank={self.ps.tp_rank} "
+                    f"{req.rid=} {req.bootstrap_room=}"
+                )
+                try:
+                    req.disagg_kv_sender.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                logger.warning(error_message)
+                # See the Success branch above: still need to release the
+                # (deferred) KV cache regardless of transfer outcome.
+                release_kv_cache(req, self.tree_cache)
+                done_reqs.append(req)
+            else:
+                logger.warning_once(
+                    f"D2P: Unexpected polling state {poll} for rid {req.rid} in inflight queue; "
+                    f"treating as undone",
+                )
+                undone_reqs.append(req)
+
+        for req in done_reqs:
+            req: Req
+
+            # D2P sends share the same req_to_metadata_buffer_idx_allocator
+            # pool as the forward P->D path. Releasing here on both Success
+            # and Failed avoids leaking a slot from the shared pool.
+            maybe_release_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+
+        self.d2p_send_inflight_queue = undone_reqs
+
+    def send_d2p_kv_chunk(self: Scheduler, req: Req) -> None:
+        """
+        Send the decode-generated OUTPUT-region KV (decode -> prefill) for a
+        single D2P request whose sender has just finished bootstrapping
+        (i.e. it was returned by d2p_send_bootstrap_queue.pop_bootstrapped()).
+
+        Reuses the forward prefill->decode send_kv_chunk() unmodified (same
+        SWA/Mamba/DSA state-payload logic), reading directly from the still
+        -live req_to_token_pool slot: _handle_finished_req() deliberately
+        did NOT call release_kv_cache() for D2P requests, so req.req_pool_idx
+        is still valid here. release_kv_cache() is called later, once the
+        transfer actually completes (see process_d2p_send_inflight_queue()).
+        """
+        end_idx = len(req.origin_input_ids) + len(req.output_ids)
+        self.d2p_send_inflight_queue.append(req)
+        self.send_kv_chunk(
+            req,
+            last_chunk=True,
+            end_idx=end_idx,
+            metadata_buffers=self.disagg_metadata_buffers,
+            kv_manager=self.d2p_send_bootstrap_queue.kv_manager,
+        )

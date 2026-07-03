@@ -382,7 +382,8 @@ class MultiTokenizerRouter:
             print_exception_wrapper(self.handle_loop), self._loop
         )
         self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
-        self.d2p_bootstrap_server = start_d2p_service(self.server_args)
+        if self.server_args.disaggregation_enable_d2p_kv_replication:
+            self.d2p_bootstrap_server = start_d2p_service(self.server_args)
 
         # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: set[str] = set()
